@@ -47,11 +47,6 @@
           #     nativeBuildInputs = [pkgs.pkg-config];
           #     buildInputs =
           #       [pkgs.zlib]
-          #       ++ (with pkgs-cuda; [
-          #         cudaPackages_12_8.cuda_cudart
-          #         cudaPackages_12_8.cudnn
-          #         cudaPackages_12_8.cudatoolkit
-          #       ]);
           #     meta.mainProgram = "nephrid";
           #     cargoBuildFlags = ["--bin" "nephrid"];
           #     cargoTestFlags = ["--bin" "nephrid"];
@@ -68,45 +63,16 @@
             packages = let
               # python packages for weather-factory-pkgs
               weather-factory-pkgs = ps: with ps; [matplotlib];
-            in
-              (with pkgs; [
-                cutechess
-                fastchess
-                bacon
-                perf
-                act
-                (python3.withPackages (ps: weather-factory-pkgs ps))
-                gnuplot
-                cargo-hack
-              ])
-              ++ (with pkgs-cuda; [
-                # reference: https://discourse.nixos.org/t/cuda-12-8-support-in-nixpkgs/60645/39
-                autoconf
-                binutils
-                curl
-                freeglut
-                git
-                gitRepo
-                gnumake
-                gnupg
-                gperf
-                libGL
-                libGLU
-                linuxPackages.nvidia_x11
-                m4
-                ncurses5
-                procps
-                stdenv.cc
-                unzip
-                util-linux
-                xorg.libX11
-                xorg.libXext
-                xorg.libXi
-                xorg.libXmu
-                xorg.libXrandr
-                xorg.libXv
-                zlib
-              ]);
+            in (with pkgs; [
+              cutechess
+              fastchess
+              bacon
+              perf
+              act
+              (python3.withPackages (ps: weather-factory-pkgs ps))
+              gnuplot
+              cargo-hack
+            ]);
 
             buildInputs = [
               rustToolchain
