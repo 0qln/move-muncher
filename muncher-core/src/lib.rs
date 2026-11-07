@@ -184,20 +184,34 @@ impl<T: Turn, C: Castling, Ep: EpSquare> Pos<T, C, Ep> {
     }
 }
 
-pub fn perft<T: Turn, C: Castling, Ep: EpSquare>(pos: &UnsafeCell<Pos<T, C, Ep>>, depth: u8) -> u64 {
-    fold_moves(unsafe { pos.get() }, 1, |mut count, m| {
-        let pos = unsafe { pos.into_inner() };
-        let pos = pos.make_move(m);
-        count += perft(pos, depth - 1);
-        pos.unmake_move(m);
-        count
-    })
+trait FoldMove<B> {
+    /// Fold a single move. `m` is generic so the body can name it at its own
+    /// type level (e.g. pass it to `Pos::make_move`).
+    fn fold<M: Move>(&mut self, acc: B, m: M) -> B;
 }
 
-fn fold_moves<T: Turn, C: Castling, Ep: EpSquare, B, F, R>(pos: &Pos<T, C, Ep>, init: B, f: F) -> R
+pub fn perft<T: Turn, C: Castling, Ep: EpSquare>(pos: &UnsafeCell<Pos<T, C, Ep>>, depth: u8) -> u64 {
+    struct Visitor<'a, T, C, Ep> {
+        pos: &'a UnsafeCell<Pos<T, C, Ep>>,
+        depth: u8,
+    }
+
+    impl<T: Turn, C: Castling, Ep: EpSquare> FoldMove<u64> for Visitor<'_, T, C, Ep> {
+        fn fold<M: Move>(&mut self, count: u64, m: M) -> u64 {
+            let pos = unsafe { self.pos.into_inner() };
+            let pos = pos.make_move(m);
+            let count = count + perft(pos, self.depth - 1);
+            pos.unmake_move(m);
+            count
+        }
+    }
+
+    fold_moves(unsafe { &*pos.get() }, 1, Visitor { pos, depth })
+}
+
+fn fold_moves<T: Turn, C: Castling, Ep: EpSquare, B, V>(pos: &Pos<T, C, Ep>, init: B, mut visitor: V) -> B
 where
-    F: FnMut<M: Move>(B, Move) -> R,
-    R: Try<Output = B>,
+    V: FoldMove<B>,
 {
     todo!()
 }
