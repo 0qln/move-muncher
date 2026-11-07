@@ -175,9 +175,6 @@ pub struct Pos<'id, Turn, Castling, EpSquare> {
     board: &'id GhostCell<'id, engine::core::position::Position>,
 }
 
-// `PhantomData` and `&GhostCell` are `Copy` regardless of `T`/`C`/`Ep`, so
-// implement these by hand: `derive` would add `T: Clone` (etc.) bounds the
-// type params don't satisfy.
 impl<T, C, Ep> Clone for Pos<'_, T, C, Ep> {
     fn clone(&self) -> Self {
         *self
@@ -186,7 +183,11 @@ impl<T, C, Ep> Clone for Pos<'_, T, C, Ep> {
 impl<T, C, Ep> Copy for Pos<'_, T, C, Ep> {}
 
 impl<'id, T: Turn, C: Castling, Ep: EpSquare> Pos<'id, T, C, Ep> {
-    fn make_move<M: Move>(&self, m: M, token: &mut GhostToken<'id>) -> Pos<'id, T::Next, C::Next<M, T>, Ep::Next<M>> {
+    fn make_move<M: Move>(
+        &self,
+        m: M,
+        token: &mut GhostToken<'id>,
+    ) -> Pos<'id, T::Next, C::Next<M, T>, Ep::Next<M>> {
         // TODO: bridge the type-level `M` to a concrete `engine::core::move::Move`,
         // then `self.board.borrow_mut(token).make_move(engine_move, &mut ());`
         todo!()
@@ -198,10 +199,8 @@ impl<'id, T: Turn, C: Castling, Ep: EpSquare> Pos<'id, T, C, Ep> {
     }
 }
 
-trait FoldMove<'id, B> {
-    /// Fold a single move. `m` is generic so the body can name it at its own
-    /// type level (e.g. pass it to `Pos::make_move`).
-    fn fold<M: Move>(&mut self, acc: B, m: M, token: &mut GhostToken<'id>) -> B;
+trait MoveVisitor<'id, B> {
+    fn invoke<M: Move>(&mut self, acc: B, m: M, token: &mut GhostToken<'id>) -> B;
 }
 
 pub fn perft<'id, T: Turn, C: Castling, Ep: EpSquare>(
@@ -218,8 +217,8 @@ pub fn perft<'id, T: Turn, C: Castling, Ep: EpSquare>(
         depth: u8,
     }
 
-    impl<'id, T: Turn, C: Castling, Ep: EpSquare> FoldMove<'id, u64> for Visitor<'id, T, C, Ep> {
-        fn fold<M: Move>(&mut self, count: u64, m: M, token: &mut GhostToken<'id>) -> u64 {
+    impl<'id, T: Turn, C: Castling, Ep: EpSquare> MoveVisitor<'id, u64> for Visitor<'id, T, C, Ep> {
+        fn invoke<M: Move>(&mut self, count: u64, m: M, token: &mut GhostToken<'id>) -> u64 {
             let next = self.pos.make_move(m, token);
             let count = count + perft(next, token, self.depth - 1);
             next.unmake_move(m, token);
@@ -237,7 +236,7 @@ fn fold_moves<'id, T: Turn, C: Castling, Ep: EpSquare, B, V>(
     token: &mut GhostToken<'id>,
 ) -> B
 where
-    V: FoldMove<'id, B>,
+    V: MoveVisitor<'id, B>,
 {
     todo!()
 }
