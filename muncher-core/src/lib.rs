@@ -2,7 +2,8 @@
 #![allow(non_camel_case_types)]
 
 use engine::core::coordinates::Square;
-use std::{cell::UnsafeCell, marker::PhantomData};
+use ghost_cell::{GhostCell, GhostToken};
+use std::marker::PhantomData;
 
 pub trait Turn {
     type Next: Turn;
@@ -165,56 +166,78 @@ mod move_flags {
     }
 }
 
-pub struct Pos<Turn, Castling, EpSquare> {
+pub struct Pos<'id, Turn, Castling, EpSquare> {
     _turn: PhantomData<Turn>,
     _castling: PhantomData<Castling>,
     _ep_square: PhantomData<EpSquare>,
 
     // todo: replace with lean implementation
-    runtime: engine::core::position::Position,
+    board: &'id GhostCell<'id, engine::core::position::Position>,
 }
 
-impl<T: Turn, C: Castling, Ep: EpSquare> Pos<T, C, Ep> {
-    fn make_move<M: Move>(&mut self, m: M) -> &mut Pos<T::Next, C::Next<M, T>, Ep::Next<M>> {
+// `PhantomData` and `&GhostCell` are `Copy` regardless of `T`/`C`/`Ep`, so
+// implement these by hand: `derive` would add `T: Clone` (etc.) bounds the
+// type params don't satisfy.
+impl<T, C, Ep> Clone for Pos<'_, T, C, Ep> {
+    fn clone(&self) -> Self {
+        *self
+    }
+}
+impl<T, C, Ep> Copy for Pos<'_, T, C, Ep> {}
+
+impl<'id, T: Turn, C: Castling, Ep: EpSquare> Pos<'id, T, C, Ep> {
+    fn make_move<M: Move>(&self, m: M, token: &mut GhostToken<'id>) -> Pos<'id, T::Next, C::Next<M, T>, Ep::Next<M>> {
+        // TODO: bridge the type-level `M` to a concrete `engine::core::move::Move`,
+        // then `self.board.borrow_mut(token).make_move(engine_move, &mut ());`
         todo!()
     }
 
-    fn unmake_move<M: Move>(&mut self, m: M) {
+    fn unmake_move<M: Move>(&self, m: M, token: &mut GhostToken<'id>) {
+        // TODO: `self.board.borrow_mut(token).unmake_move(engine_move, &mut ());`
         todo!()
     }
 }
 
-trait FoldMove<B> {
+trait FoldMove<'id, B> {
     /// Fold a single move. `m` is generic so the body can name it at its own
     /// type level (e.g. pass it to `Pos::make_move`).
-    fn fold<M: Move>(&mut self, acc: B, m: M) -> B;
+    fn fold<M: Move>(&mut self, acc: B, m: M, token: &mut GhostToken<'id>) -> B;
 }
 
-pub fn perft<T: Turn, C: Castling, Ep: EpSquare>(pos: &mut Pos<T, C, Ep>, depth: u8) -> u64 {
-    struct Visitor<'a, T, C, Ep> {
-        pos: &'a mut Pos<T, C, Ep>,
+pub fn perft<'id, T: Turn, C: Castling, Ep: EpSquare>(
+    pos: Pos<'id, T, C, Ep>,
+    token: &mut GhostToken<'id>,
+    depth: u8,
+) -> u64 {
+    if depth == 0 {
+        return 1;
+    }
+
+    struct Visitor<'id, T, C, Ep> {
+        pos: Pos<'id, T, C, Ep>,
         depth: u8,
     }
 
-    impl<T: Turn, C: Castling, Ep: EpSquare> FoldMove<u64> for Visitor<'_, T, C, Ep> {
-        fn fold<M: Move>(&mut self, count: u64, m: M) -> u64 {
-            let pos = self.pos.make_move(m);
-            let count = count + perft(pos, self.depth - 1);
-            pos.unmake_move(m);
+    impl<'id, T: Turn, C: Castling, Ep: EpSquare> FoldMove<'id, u64> for Visitor<'id, T, C, Ep> {
+        fn fold<M: Move>(&mut self, count: u64, m: M, token: &mut GhostToken<'id>) -> u64 {
+            let next = self.pos.make_move(m, token);
+            let count = count + perft(next, token, self.depth - 1);
+            next.unmake_move(m, token);
             count
         }
     }
 
-    fold_moves(pos, 1, Visitor { pos, depth })
+    fold_moves(pos, 0, Visitor { pos, depth }, token)
 }
 
-fn fold_moves<T: Turn, C: Castling, Ep: EpSquare, B, V>(
-    pos: &Pos<T, C, Ep>,
+fn fold_moves<'id, T: Turn, C: Castling, Ep: EpSquare, B, V>(
+    pos: Pos<'id, T, C, Ep>,
     init: B,
     mut visitor: V,
+    token: &mut GhostToken<'id>,
 ) -> B
 where
-    V: FoldMove<B>,
+    V: FoldMove<'id, B>,
 {
     todo!()
 }
