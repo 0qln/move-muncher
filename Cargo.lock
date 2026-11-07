@@ -2667,6 +2667,12 @@ dependencies = [
 ]
 
 [[package]]
+name = "ghost-cell"
+version = "0.2.6"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "d8449d342b1c67f49169e92e71deb7b9b27f30062301a16dbc27a4cc8d2351b7"
+
+[[package]]
 name = "gif"
 version = "0.14.2"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -3726,6 +3732,7 @@ name = "muncher_core"
 version = "0.1.0"
 dependencies = [
  "engine",
+ "ghost-cell",
 ]
 
 [[package]]
