@@ -105,7 +105,7 @@ mod ep_squares {
     struct Some(Square);
 }
 
-pub trait Move {
+pub trait Move: Copy {
     type Flag: MoveFlag;
 }
 
@@ -175,11 +175,11 @@ pub struct Pos<Turn, Castling, EpSquare> {
 }
 
 impl<T: Turn, C: Castling, Ep: EpSquare> Pos<T, C, Ep> {
-    fn make_move<M: Move>(mut self, m: M) -> Pos<T::Next, C::Next<M, T>, Ep::Next<M>> {
+    fn make_move<M: Move>(&mut self, m: M) -> &mut Pos<T::Next, C::Next<M, T>, Ep::Next<M>> {
         todo!()
     }
 
-    fn unmake_move<M: Move>(mut self, m: M) {
+    fn unmake_move<M: Move>(&mut self, m: M) {
         todo!()
     }
 }
@@ -190,26 +190,29 @@ trait FoldMove<B> {
     fn fold<M: Move>(&mut self, acc: B, m: M) -> B;
 }
 
-pub fn perft<T: Turn, C: Castling, Ep: EpSquare>(pos: &UnsafeCell<Pos<T, C, Ep>>, depth: u8) -> u64 {
+pub fn perft<T: Turn, C: Castling, Ep: EpSquare>(pos: &mut Pos<T, C, Ep>, depth: u8) -> u64 {
     struct Visitor<'a, T, C, Ep> {
-        pos: &'a UnsafeCell<Pos<T, C, Ep>>,
+        pos: &'a mut Pos<T, C, Ep>,
         depth: u8,
     }
 
     impl<T: Turn, C: Castling, Ep: EpSquare> FoldMove<u64> for Visitor<'_, T, C, Ep> {
         fn fold<M: Move>(&mut self, count: u64, m: M) -> u64 {
-            let pos = unsafe { self.pos.into_inner() };
-            let pos = pos.make_move(m);
+            let pos = self.pos.make_move(m);
             let count = count + perft(pos, self.depth - 1);
             pos.unmake_move(m);
             count
         }
     }
 
-    fold_moves(unsafe { &*pos.get() }, 1, Visitor { pos, depth })
+    fold_moves(pos, 1, Visitor { pos, depth })
 }
 
-fn fold_moves<T: Turn, C: Castling, Ep: EpSquare, B, V>(pos: &Pos<T, C, Ep>, init: B, mut visitor: V) -> B
+fn fold_moves<T: Turn, C: Castling, Ep: EpSquare, B, V>(
+    pos: &Pos<T, C, Ep>,
+    init: B,
+    mut visitor: V,
+) -> B
 where
     V: FoldMove<B>,
 {
