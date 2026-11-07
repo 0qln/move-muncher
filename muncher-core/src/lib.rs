@@ -1,21 +1,15 @@
 #![allow(unused_labels)]
+#![allow(non_camel_case_types)]
 
-use std::{marker::PhantomData, mem::MaybeUninit};
-    use engine::core::coordinates::Square;
-
-pub trait Position {
-    fn make_move<M: Move>(self, m: M);
-    fn unmake_move<M: Move>(self, m: M);
-}
+use engine::core::coordinates::Square;
+use std::{cell::UnsafeCell, marker::PhantomData};
 
 pub trait Turn {
     type Next: Turn;
+    type Prev: Turn;
 
-    /// `C` with this color's king-side castling right cleared.
-    type TakeKing<C: Castling>: Castling;
-
-    /// `C` with this color's queen-side castling right cleared.
-    type TakeQueen<C: Castling>: Castling;
+    type Castling_TakeK<C: Castling>: Castling;
+    type Castling_TakeQ<C: Castling>: Castling;
 }
 mod turns {
     use super::*;
@@ -25,14 +19,18 @@ mod turns {
 
     impl Turn for White {
         type Next = Black;
-        type TakeKing<C: Castling> = C::Take_1000;
-        type TakeQueen<C: Castling> = C::Take_0100;
+        type Prev = Black;
+
+        type Castling_TakeK<C: Castling> = C::Take_1000;
+        type Castling_TakeQ<C: Castling> = C::Take_0100;
     }
 
     impl Turn for Black {
         type Next = White;
-        type TakeKing<C: Castling> = C::Take_0010;
-        type TakeQueen<C: Castling> = C::Take_0001;
+        type Prev = White;
+
+        type Castling_TakeK<C: Castling> = C::Take_0010;
+        type Castling_TakeQ<C: Castling> = C::Take_0001;
     }
 }
 
@@ -69,8 +67,8 @@ mod castling {
                     type Take_0100 = $t0100;
                     type Take_0010 = $t0010;
                     type Take_0001 = $t0001;
-                    type Take_K<T: Turn> = <T as Turn>::TakeKing<Self>;
-                    type Take_Q<T: Turn> = <T as Turn>::TakeQueen<Self>;
+                    type Take_K<T: Turn> = <T as Turn>::Castling_TakeK<Self>;
+                    type Take_Q<T: Turn> = <T as Turn>::Castling_TakeQ<Self>;
                     type Next<M: Move, T: Turn> = <M::Flag as MoveFlag>::Apply<Self, T>;
                 }
             )*
@@ -172,10 +170,11 @@ pub struct Pos<Turn, Castling, EpSquare> {
     _castling: PhantomData<Castling>,
     _ep_square: PhantomData<EpSquare>,
 
+    // todo: replace with lean implementation
     runtime: engine::core::position::Position,
 }
 
-impl<T: Turn, C: Castling, Ep: EpSquare> Position for Pos<T, C, Ep> {
+impl<T: Turn, C: Castling, Ep: EpSquare> Pos<T, C, Ep> {
     fn make_move<M: Move>(mut self, m: M) -> Pos<T::Next, C::Next<M, T>, Ep::Next<M>> {
         todo!()
     }
@@ -185,30 +184,20 @@ impl<T: Turn, C: Castling, Ep: EpSquare> Position for Pos<T, C, Ep> {
     }
 }
 
-pub fn count_positions(pos: impl Position, max_depth: u8) -> u64 {
-    struct StackInfo {
-        moves: [Move; 256],
-    }
-
-    let mut count = 1;
-    let mut pos = pos;
-    let mut stack = [const { MaybeUninit::<StackInfo>::uninit() }; 2 << 8];
-
-    'depth: for depth in 0..max_depth {
-        let si = unsafe { stack[depth].assume_init_mut() };
-        fill_moves(&mut si.moves);
-
-        'moves: for &m in &si.moves {
-            let pos = pos.make_move<>(m);
-            count += 1;
-        }
-    }
-
-    count
+pub fn perft<T: Turn, C: Castling, Ep: EpSquare>(pos: &UnsafeCell<Pos<T, C, Ep>>, depth: u8) -> u64 {
+    fold_moves(unsafe { pos.get() }, 1, |mut count, m| {
+        let pos = unsafe { pos.into_inner() };
+        let pos = pos.make_move(m);
+        count += perft(pos, depth - 1);
+        pos.unmake_move(m);
+        count
+    })
 }
 
-fn fill_moves(moves: &mut [Move; 256]) {
-    for m in moves.iter_mut() {
-        *m = Move;
-    }
+fn fold_moves<T: Turn, C: Castling, Ep: EpSquare, B, F, R>(pos: &Pos<T, C, Ep>, init: B, f: F) -> R
+where
+    F: FnMut<M: Move>(B, Move) -> R,
+    R: Try<Output = B>,
+{
+    todo!()
 }
