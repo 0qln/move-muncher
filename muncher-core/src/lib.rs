@@ -1,7 +1,14 @@
 #![allow(unused_labels)]
 #![allow(non_camel_case_types)]
 
-use engine::core::coordinates::Square;
+use engine::core::{
+    bitboard::Bitboard,
+    color::{colors, Color},
+    coordinates::{castling as castling_utils, files, pawn_utils, Square},
+    move_iter::{bishop, king, knight, pawn, rook, sliding_piece::SlidingAttacks},
+    piece::{piece_type, Piece},
+    position::PieceInfo,
+};
 use ghost_cell::{GhostCell, GhostToken};
 use std::marker::PhantomData;
 
@@ -9,9 +16,13 @@ pub trait Turn {
     type Next: Turn;
     type Prev: Turn;
 
+    /// The runtime color this turn represents.
+    const COLOR: Color;
+
     type Castling_TakeK<C: Castling>: Castling;
     type Castling_TakeQ<C: Castling>: Castling;
 }
+
 mod turns {
     use super::*;
 
@@ -21,6 +32,7 @@ mod turns {
     impl Turn for White {
         type Next = Black;
         type Prev = Black;
+        const COLOR: Color = colors::WHITE;
 
         type Castling_TakeK<C: Castling> = C::Take_1000;
         type Castling_TakeQ<C: Castling> = C::Take_0100;
@@ -29,6 +41,7 @@ mod turns {
     impl Turn for Black {
         type Next = White;
         type Prev = White;
+        const COLOR: Color = colors::BLACK;
 
         type Castling_TakeK<C: Castling> = C::Take_0010;
         type Castling_TakeQ<C: Castling> = C::Take_0001;
@@ -49,6 +62,10 @@ pub trait Castling {
     /// The next castling state without QUEEN_BLACK.
     type Take_0001: Castling;
 
+    /// The runtime castling-rights bitmask:
+    /// KING_WHITE=0b1000, QUEEN_WHITE=0b0100, KING_BLACK=0b0010, QUEEN_BLACK=0b0001.
+    const RIGHTS: u8;
+
     type Take_Q<T: Turn>: Castling;
     type Take_K<T: Turn>: Castling;
 
@@ -60,7 +77,7 @@ mod castling {
     use super::*;
 
     macro_rules! impl_castling_states {
-        ($( ($st:ident, $t1000:ident, $t0100:ident, $t0010:ident, $t0001:ident) ),* $(,)?) => {
+        ($( ($st:ident, $t1000:ident, $t0100:ident, $t0010:ident, $t0001:ident, $rights:literal) ),* $(,)?) => {
             $(
                 pub struct $st;
                 impl Castling for $st {
@@ -68,6 +85,7 @@ mod castling {
                     type Take_0100 = $t0100;
                     type Take_0010 = $t0010;
                     type Take_0001 = $t0001;
+                    const RIGHTS: u8 = $rights;
                     type Take_K<T: Turn> = <T as Turn>::Castling_TakeK<Self>;
                     type Take_Q<T: Turn> = <T as Turn>::Castling_TakeQ<Self>;
                     type Next<M: Move, T: Turn> = <M::Flag as MoveFlag>::Apply<Self, T>;
@@ -77,22 +95,22 @@ mod castling {
     }
 
     impl_castling_states! {
-        (_0000, _0000, _0000, _0000, _0000),
-        (_0001, _0001, _0001, _0001, _0000),
-        (_0010, _0010, _0010, _0000, _0010),
-        (_0011, _0011, _0011, _0001, _0010),
-        (_0100, _0100, _0000, _0100, _0100),
-        (_0101, _0101, _0001, _0101, _0100),
-        (_0110, _0110, _0010, _0100, _0110),
-        (_0111, _0111, _0011, _0101, _0110),
-        (_1000, _0000, _1000, _1000, _1000),
-        (_1001, _0001, _1001, _1001, _1000),
-        (_1010, _0010, _1010, _1000, _1010),
-        (_1011, _0011, _1011, _1001, _1010),
-        (_1100, _0100, _1000, _1100, _1100),
-        (_1101, _0101, _1001, _1101, _1100),
-        (_1110, _0110, _1010, _1100, _1110),
-        (_1111, _0111, _1011, _1101, _1110),
+        (_0000, _0000, _0000, _0000, _0000, 0b0000),
+        (_0001, _0001, _0001, _0001, _0000, 0b0001),
+        (_0010, _0010, _0010, _0000, _0010, 0b0010),
+        (_0011, _0011, _0011, _0001, _0010, 0b0011),
+        (_0100, _0100, _0000, _0100, _0100, 0b0100),
+        (_0101, _0101, _0001, _0101, _0100, 0b0101),
+        (_0110, _0110, _0010, _0100, _0110, 0b0110),
+        (_0111, _0111, _0011, _0101, _0110, 0b0111),
+        (_1000, _0000, _1000, _1000, _1000, 0b1000),
+        (_1001, _0001, _1001, _1001, _1000, 0b1001),
+        (_1010, _0010, _1010, _1000, _1010, 0b1010),
+        (_1011, _0011, _1011, _1001, _1010, 0b1011),
+        (_1100, _0100, _1000, _1100, _1100, 0b1100),
+        (_1101, _0101, _1001, _1101, _1100, 0b1101),
+        (_1110, _0110, _1010, _1100, _1110, 0b1110),
+        (_1111, _0111, _1011, _1101, _1110, 0b1111),
     }
 }
 
@@ -108,61 +126,234 @@ mod ep_squares {
 
 pub trait Move: Copy {
     type Flag: MoveFlag;
+
+    fn from(&self) -> Square;
+    fn to(&self) -> Square;
+}
+
+/// A move value carrying its from/to squares, with the flag encoded at the
+/// type level so transitions like `Castling::Next<M, T>` see it statically.
+pub struct MoveValue<F: MoveFlag> {
+    pub from: Square,
+    pub to: Square,
+    _flag: PhantomData<F>,
+}
+
+impl<F: MoveFlag> Clone for MoveValue<F> {
+    fn clone(&self) -> Self {
+        *self
+    }
+}
+impl<F: MoveFlag> Copy for MoveValue<F> {}
+impl<F: MoveFlag> Move for MoveValue<F> {
+    type Flag = F;
+    fn from(&self) -> Square {
+        self.from
+    }
+    fn to(&self) -> Square {
+        self.to
+    }
+}
+
+/// The board: piece placement (`PieceInfo`) plus the runtime en-passant square
+/// and an undo stack for captures. Turn, castling and en-passant availability
+/// live in the type parameters of `Pos`; only the *square* is runtime.
+pub struct Board {
+    pieces: PieceInfo,
+    ep_square: Option<Square>,
+    history: Vec<Undo>,
+}
+
+struct Undo {
+    captured: Option<(Square, Piece)>,
+    prev_ep: Option<Square>,
+}
+
+impl Board {
+    fn move_piece(&mut self, from: Square, to: Square) {
+        self.pieces.move_piece(from, to, &mut ());
+    }
+    fn remove_piece(&mut self, sq: Square) -> Piece {
+        self.pieces.remove_piece(sq, &mut ())
+    }
+    fn put_piece(&mut self, sq: Square, piece: Piece) {
+        self.pieces.put_piece(sq, piece, &mut ());
+    }
+
+    /// Push an undo record (clearing the en-passant square) for the move about
+    /// to be applied.
+    fn begin_move(&mut self, captured: Option<(Square, Piece)>) {
+        let prev_ep = self.ep_square;
+        self.ep_square = None;
+        self.history.push(Undo { captured, prev_ep });
+    }
+
+    /// Pop the undo record, restoring the en-passant square, and return the
+    /// captured piece (if any) to be re-placed.
+    fn end_move(&mut self) -> Option<(Square, Piece)> {
+        let undo = self.history.pop().unwrap();
+        self.ep_square = undo.prev_ep;
+        undo.captured
+    }
 }
 
 pub trait MoveFlag {
     /// The castling state after a move carrying this flag is played.
     type Apply<C: Castling, T: Turn>: Castling;
+
+    fn make(board: &mut Board, from: Square, to: Square, us: Color);
+    fn unmake(board: &mut Board, from: Square, to: Square, us: Color);
 }
+
 mod move_flags {
     use super::*;
 
-    struct Quiet;
-    struct DoublePawnPush;
-    struct PromotionKnight;
-    struct PromotionBishop;
-    struct PromotionRook;
-    struct PromotionQueen;
-    struct CapturePromotionKnight;
-    struct CapturePromotionBishop;
-    struct CapturePromotionRook;
-    struct CapturePromotionQueen;
-    struct KingCastle;
-    struct QueenCastle;
-    struct Capture;
-    struct EnPassant;
+    pub struct Quiet;
+    pub struct DoublePawnPush;
+    pub struct PromotionKnight;
+    pub struct PromotionBishop;
+    pub struct PromotionRook;
+    pub struct PromotionQueen;
+    pub struct CapturePromotionKnight;
+    pub struct CapturePromotionBishop;
+    pub struct CapturePromotionRook;
+    pub struct CapturePromotionQueen;
+    pub struct KingCastle;
+    pub struct QueenCastle;
+    pub struct Capture;
+    pub struct EnPassant;
 
-    macro_rules! keep_castling {
-        ($($flag:ident),* $(,)?) => {
-            $(
-                impl MoveFlag for $flag {
-                    type Apply<C: Castling, T: Turn> = C;
+    impl MoveFlag for Quiet {
+        type Apply<C: Castling, T: Turn> = C;
+        fn make(board: &mut Board, from: Square, to: Square, _us: Color) {
+            board.begin_move(None);
+            board.move_piece(from, to);
+        }
+        fn unmake(board: &mut Board, from: Square, to: Square, _us: Color) {
+            board.move_piece(to, from);
+            board.end_move();
+        }
+    }
+
+    impl MoveFlag for DoublePawnPush {
+        type Apply<C: Castling, T: Turn> = C;
+        fn make(board: &mut Board, from: Square, to: Square, us: Color) {
+            board.begin_move(None);
+            board.move_piece(from, to);
+            let ep = pawn_utils::backward(Bitboard::from(to), pawn_utils::single_step(us)).lsb().unwrap();
+            board.ep_square = Some(ep);
+        }
+        fn unmake(board: &mut Board, from: Square, to: Square, _us: Color) {
+            board.move_piece(to, from);
+            board.end_move();
+        }
+    }
+
+    impl MoveFlag for Capture {
+        type Apply<C: Castling, T: Turn> = C;
+        fn make(board: &mut Board, from: Square, to: Square, _us: Color) {
+            let captured = board.remove_piece(to);
+            board.begin_move(Some((to, captured)));
+            board.move_piece(from, to);
+        }
+        fn unmake(board: &mut Board, from: Square, to: Square, _us: Color) {
+            board.move_piece(to, from);
+            let (sq, cap) = board.end_move().unwrap();
+            board.put_piece(sq, cap);
+        }
+    }
+
+    impl MoveFlag for EnPassant {
+        type Apply<C: Castling, T: Turn> = C;
+        fn make(board: &mut Board, from: Square, to: Square, us: Color) {
+            let cap_sq = pawn_utils::backward(Bitboard::from(to), pawn_utils::single_step(us)).lsb().unwrap();
+            let captured = board.remove_piece(cap_sq);
+            board.begin_move(Some((cap_sq, captured)));
+            board.move_piece(from, to);
+        }
+        fn unmake(board: &mut Board, from: Square, to: Square, _us: Color) {
+            board.move_piece(to, from);
+            let (sq, cap) = board.end_move().unwrap();
+            board.put_piece(sq, cap);
+        }
+    }
+
+    macro_rules! impl_promo {
+        ($flag:ident, $pt:path) => {
+            impl MoveFlag for $flag {
+                type Apply<C: Castling, T: Turn> = C;
+                fn make(board: &mut Board, from: Square, to: Square, us: Color) {
+                    board.begin_move(None);
+                    board.remove_piece(from);
+                    board.put_piece(to, Piece::from((us, $pt)));
                 }
-            )*
+                fn unmake(board: &mut Board, from: Square, to: Square, us: Color) {
+                    board.remove_piece(to);
+                    board.put_piece(from, Piece::from((us, piece_type::PAWN)));
+                    board.end_move();
+                }
+            }
         };
     }
+    impl_promo!(PromotionKnight, piece_type::KNIGHT);
+    impl_promo!(PromotionBishop, piece_type::BISHOP);
+    impl_promo!(PromotionRook, piece_type::ROOK);
+    impl_promo!(PromotionQueen, piece_type::QUEEN);
 
-    keep_castling! {
-        Quiet,
-        DoublePawnPush,
-        PromotionKnight,
-        PromotionBishop,
-        PromotionRook,
-        PromotionQueen,
-        CapturePromotionKnight,
-        CapturePromotionBishop,
-        CapturePromotionRook,
-        CapturePromotionQueen,
-        Capture,
-        EnPassant,
+    macro_rules! impl_capture_promo {
+        ($flag:ident, $pt:path) => {
+            impl MoveFlag for $flag {
+                type Apply<C: Castling, T: Turn> = C;
+                fn make(board: &mut Board, from: Square, to: Square, us: Color) {
+                    let captured = board.remove_piece(to);
+                    board.begin_move(Some((to, captured)));
+                    board.remove_piece(from);
+                    board.put_piece(to, Piece::from((us, $pt)));
+                }
+                fn unmake(board: &mut Board, from: Square, to: Square, us: Color) {
+                    board.remove_piece(to);
+                    board.put_piece(from, Piece::from((us, piece_type::PAWN)));
+                    let (sq, cap) = board.end_move().unwrap();
+                    board.put_piece(sq, cap);
+                }
+            }
+        };
     }
+    impl_capture_promo!(CapturePromotionKnight, piece_type::KNIGHT);
+    impl_capture_promo!(CapturePromotionBishop, piece_type::BISHOP);
+    impl_capture_promo!(CapturePromotionRook, piece_type::ROOK);
+    impl_capture_promo!(CapturePromotionQueen, piece_type::QUEEN);
 
     impl MoveFlag for KingCastle {
         type Apply<C: Castling, T: Turn> = <<C as Castling>::Take_K<T> as Castling>::Take_Q<T>;
+        fn make(board: &mut Board, from: Square, to: Square, us: Color) {
+            let rank = castling_utils::castling_rank(us);
+            board.begin_move(None);
+            board.move_piece(from, to);
+            board.move_piece(Square::from((files::H, rank)), Square::from((files::F, rank)));
+        }
+        fn unmake(board: &mut Board, from: Square, to: Square, us: Color) {
+            let rank = castling_utils::castling_rank(us);
+            board.move_piece(to, from);
+            board.move_piece(Square::from((files::F, rank)), Square::from((files::H, rank)));
+            board.end_move();
+        }
     }
 
     impl MoveFlag for QueenCastle {
         type Apply<C: Castling, T: Turn> = <<C as Castling>::Take_K<T> as Castling>::Take_Q<T>;
+        fn make(board: &mut Board, from: Square, to: Square, us: Color) {
+            let rank = castling_utils::castling_rank(us);
+            board.begin_move(None);
+            board.move_piece(from, to);
+            board.move_piece(Square::from((files::A, rank)), Square::from((files::D, rank)));
+        }
+        fn unmake(board: &mut Board, from: Square, to: Square, us: Color) {
+            let rank = castling_utils::castling_rank(us);
+            board.move_piece(to, from);
+            board.move_piece(Square::from((files::D, rank)), Square::from((files::A, rank)));
+            board.end_move();
+        }
     }
 }
 
@@ -171,8 +362,7 @@ pub struct Pos<'id, Turn, Castling, EpSquare> {
     _castling: PhantomData<Castling>,
     _ep_square: PhantomData<EpSquare>,
 
-    // todo: replace with lean implementation
-    board: &'id GhostCell<'id, engine::core::position::Position>,
+    board: &'id GhostCell<'id, Board>,
 }
 
 impl<T, C, Ep> Clone for Pos<'_, T, C, Ep> {
@@ -183,19 +373,22 @@ impl<T, C, Ep> Clone for Pos<'_, T, C, Ep> {
 impl<T, C, Ep> Copy for Pos<'_, T, C, Ep> {}
 
 impl<'id, T: Turn, C: Castling, Ep: EpSquare> Pos<'id, T, C, Ep> {
-    fn make_move<M: Move>(
-        &self,
-        m: M,
-        token: &mut GhostToken<'id>,
-    ) -> Pos<'id, T::Next, C::Next<M, T>, Ep::Next<M>> {
-        // TODO: bridge the type-level `M` to a concrete `engine::core::move::Move`,
-        // then `self.board.borrow_mut(token).make_move(engine_move, &mut ());`
-        todo!()
+    fn make_move<M: Move>(&self, m: M, token: &mut GhostToken<'id>) -> Pos<'id, T::Next, C::Next<M, T>, Ep::Next<M>> {
+        let board = self.board.borrow_mut(token);
+        <M::Flag as MoveFlag>::make(board, m.from(), m.to(), T::COLOR);
+        Pos {
+            _turn: PhantomData,
+            _castling: PhantomData,
+            _ep_square: PhantomData,
+            board: self.board,
+        }
     }
 
     fn unmake_move<M: Move>(&self, m: M, token: &mut GhostToken<'id>) {
-        // TODO: `self.board.borrow_mut(token).unmake_move(engine_move, &mut ());`
-        todo!()
+        let board = self.board.borrow_mut(token);
+        // `T` is the side to move *after* the move was made, so the mover is
+        // the previous side.
+        <M::Flag as MoveFlag>::unmake(board, m.from(), m.to(), T::Prev::COLOR);
     }
 }
 
