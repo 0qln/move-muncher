@@ -1,5 +1,7 @@
 #![allow(unused_labels)]
 #![allow(non_camel_case_types)]
+#![feature(const_trait_impl)]
+#![feature(const_cmp)]
 
 use engine::core::{
     bitboard::Bitboard,
@@ -56,13 +58,24 @@ pub mod turns {
 
 /// KING_WHITE=0b1000, QUEEN_WHITE=0b0100, KING_BLACK=0b0010, QUEEN_BLACK=0b0001.
 #[allow(non_camel_case_types)]
-pub trait Castling {
+#[rustfmt::skip]
+pub const trait Castling {
     type Take_1000: Castling;
     type Take_0100: Castling;
     type Take_0010: Castling;
     type Take_0001: Castling;
 
     const RIGHTS: u8;
+    fn has_w_k() -> bool { Self::RIGHTS & 0b1000 != 0 }
+    fn has_w_q() -> bool { Self::RIGHTS & 0b0100 != 0 }
+    fn has_b_k() -> bool { Self::RIGHTS & 0b0010 != 0 }
+    fn has_b_q() -> bool { Self::RIGHTS & 0b0001 != 0 }
+    fn has_any() -> bool { Self::RIGHTS != 0 }
+    fn has_w() -> bool { Self::RIGHTS & 0b1100 != 0 }
+    fn has_b() -> bool { Self::RIGHTS & 0b0011 != 0 }
+    fn has_color<T: Turn>() -> bool {
+        if T::COLOR == colors::WHITE { Self::has_w() } else { Self::has_b() }
+    }
 
     type Take_Q<T: Turn>: Castling;
     type Take_K<T: Turn>: Castling;
@@ -207,7 +220,11 @@ impl Board {
             }
         }
 
-        self.history.push(Undo { captured, prev_ep, prev_castling });
+        self.history.push(Undo {
+            captured,
+            prev_ep,
+            prev_castling,
+        });
     }
 
     fn end_move(&mut self) -> Option<(Square, Piece)> {
@@ -327,7 +344,8 @@ mod move_flags {
     pub struct CapturePromotionQueen;
     pub struct KingCastle;
     pub struct QueenCastle;
-    pub struct Capture;
+    pub struct Capture; // TODO: move flag for rook capture such that we can skip the validation in
+    // the move gen and do castling rights completely at compiletime
     pub struct EnPassant;
 
     impl MoveFlag for Quiet {
@@ -816,7 +834,7 @@ where
     // are tracked at runtime in `Board::castling` and cleared when a king or
     // rook moves (or an enemy rook is captured on its home square); the home-
     // square checks below are a defensive extra.
-    if n_checkers == 0 {
+    if n_checkers == 0 && C::has_color::<T>() {
         let rank = castling_utils::castling_rank(us);
         let home_king = Square::from((files::E, rank));
         let occ_no_king = s.occ & !Bitboard::from(s.king_sq);
@@ -945,11 +963,7 @@ mod tests {
 
     fn assert_perft(fen: &str, depth: u8, expected: u64) {
         init();
-        assert_eq!(
-            perft_fen(fen, depth),
-            expected,
-            "perft({depth}) mismatch for {fen}"
-        );
+        assert_eq!(perft_fen(fen, depth), expected, "perft({depth}) mismatch for {fen}");
     }
 
     // The six standard perft positions (same set nephrid uses in
