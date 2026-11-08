@@ -431,5 +431,153 @@ fn fold_moves<'id, T: Turn, C: Castling, Ep: EpSquare, B, V>(
 where
     V: MoveVisitor<'id, B>,
 {
-    todo!()
+    struct Snapshot {
+        occ: Bitboard,
+        empty: Bitboard,
+        them: Bitboard,
+        pawns: Bitboard,
+        knights: Bitboard,
+        bishops: Bitboard,
+        rooks: Bitboard,
+        queens: Bitboard,
+        king_sq: Square,
+        ep_capture: Option<Square>,
+    }
+
+    let us = T::COLOR;
+
+    // Snapshot the board (all `Copy`), then release the immutable borrow so the
+    // visitor can take the token mutably below.
+    let s = {
+        let board = pos.board.borrow(&*token);
+        let occ = board.pieces.get_occupancy();
+        Snapshot {
+            occ,
+            empty: !occ,
+            them: board.pieces.get_color_bb(!us),
+            pawns: board.pieces.get_bitboard(piece_type::PAWN, us),
+            knights: board.pieces.get_bitboard(piece_type::KNIGHT, us),
+            bishops: board.pieces.get_bitboard(piece_type::BISHOP, us),
+            rooks: board.pieces.get_bitboard(piece_type::ROOK, us),
+            queens: board.pieces.get_bitboard(piece_type::QUEEN, us),
+            king_sq: board.pieces.get_bitboard(piece_type::KING, us).lsb().unwrap(),
+            ep_capture: board.ep_square,
+        }
+    };
+
+    let mut acc = init;
+    let step = pawn_utils::single_step(us);
+    let promo_bb = Bitboard::from(pawn_utils::promo_rank(us));
+    let start_bb = Bitboard::from(pawn_utils::start_rank(us));
+
+    macro_rules! emit {
+        ($flag:ty, $from:expr, $to:expr) => {
+            acc = visitor.invoke(acc, MoveValue::<$flag> { from: $from, to: $to, _flag: PhantomData }, token);
+        };
+    }
+
+    // Knights.
+    let mut bb = s.knights;
+    while let Some(from) = bb.pop_lsb() {
+        let targets = knight::lookup_attacks(from);
+        let mut q = targets & s.empty;
+        while let Some(to) = q.pop_lsb() { emit!(move_flags::Quiet, from, to); }
+        let mut c = targets & s.them;
+        while let Some(to) = c.pop_lsb() { emit!(move_flags::Capture, from, to); }
+    }
+
+    // King (non-castling).
+    {
+        let targets = king::lookup_attacks(s.king_sq);
+        let mut q = targets & s.empty;
+        while let Some(to) = q.pop_lsb() { emit!(move_flags::Quiet, s.king_sq, to); }
+        let mut c = targets & s.them;
+        while let Some(to) = c.pop_lsb() { emit!(move_flags::Capture, s.king_sq, to); }
+    }
+
+    // Sliders: rook-like (rooks + queens).
+    let mut bb = s.rooks | s.queens;
+    while let Some(from) = bb.pop_lsb() {
+        let targets = rook::Rook::lookup_attacks(from, s.occ);
+        let mut q = targets & s.empty;
+        while let Some(to) = q.pop_lsb() { emit!(move_flags::Quiet, from, to); }
+        let mut c = targets & s.them;
+        while let Some(to) = c.pop_lsb() { emit!(move_flags::Capture, from, to); }
+    }
+
+    // Sliders: bishop-like (bishops + queens).
+    let mut bb = s.bishops | s.queens;
+    while let Some(from) = bb.pop_lsb() {
+        let targets = bishop::Bishop::lookup_attacks(from, s.occ);
+        let mut q = targets & s.empty;
+        while let Some(to) = q.pop_lsb() { emit!(move_flags::Quiet, from, to); }
+        let mut c = targets & s.them;
+        while let Some(to) = c.pop_lsb() { emit!(move_flags::Capture, from, to); }
+    }
+
+    // Pawns.
+    let mut bb = s.pawns;
+    while let Some(from) = bb.pop_lsb() {
+        let from_bb = Bitboard::from(from);
+        let promo = !(from_bb & promo_bb).is_empty();
+
+        // Single push.
+        let push = pawn_utils::forward(from_bb, step) & s.empty;
+        if let Some(to) = push.lsb() {
+            if promo {
+                emit!(move_flags::PromotionKnight, from, to);
+                emit!(move_flags::PromotionBishop, from, to);
+                emit!(move_flags::PromotionRook, from, to);
+                emit!(move_flags::PromotionQueen, from, to);
+            } else {
+                emit!(move_flags::Quiet, from, to);
+            }
+        }
+
+        // Double push.
+        if !(from_bb & start_bb).is_empty() {
+            let dbl = pawn_utils::forward(push, step) & s.empty;
+            if let Some(to) = dbl.lsb() {
+                emit!(move_flags::DoublePawnPush, from, to);
+            }
+        }
+
+        // Captures.
+        let mut caps = pawn::lookup_attacks(from, us) & s.them;
+        while let Some(to) = caps.pop_lsb() {
+            if promo {
+                emit!(move_flags::CapturePromotionKnight, from, to);
+                emit!(move_flags::CapturePromotionBishop, from, to);
+                emit!(move_flags::CapturePromotionRook, from, to);
+                emit!(move_flags::CapturePromotionQueen, from, to);
+            } else {
+                emit!(move_flags::Capture, from, to);
+            }
+        }
+
+        // En passant.
+        if let Some(cap) = s.ep_capture {
+            if !(pawn::lookup_attacks(from, us) & Bitboard::from(cap)).is_empty() {
+                let tgt = pawn_utils::forward(Bitboard::from(cap), step).lsb().unwrap();
+                emit!(move_flags::EnPassant, from, tgt);
+            }
+        }
+    }
+
+    // Castling.
+    let rank = castling_utils::castling_rank(us);
+    if C::RIGHTS & (0b1000u8 >> (us.v() * 2)) != 0 {
+        let path = Bitboard::between(s.king_sq, Square::from((files::H, rank)));
+        if (path & s.occ).is_empty() {
+            emit!(move_flags::KingCastle, s.king_sq, Square::from((files::G, rank)));
+        }
+    }
+    if C::RIGHTS & (0b0100u8 >> (us.v() * 2)) != 0 {
+        let path = Bitboard::between(s.king_sq, Square::from((files::A, rank)));
+        if (path & s.occ).is_empty() {
+            emit!(move_flags::QueenCastle, s.king_sq, Square::from((files::C, rank)));
+        }
+    }
+
+    acc
 }
