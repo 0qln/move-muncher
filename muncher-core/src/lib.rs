@@ -161,12 +161,14 @@ impl<F: MoveFlag> Move for MoveValue<F> {
 pub struct Board {
     pieces: PieceInfo,
     ep_square: Option<Square>,
+    castling: u8,
     history: Vec<Undo>,
 }
 
 struct Undo {
     captured: Option<(Square, Piece)>,
     prev_ep: Option<Square>,
+    prev_castling: u8,
 }
 
 impl Board {
@@ -180,15 +182,38 @@ impl Board {
         self.pieces.put_piece(sq, piece, &mut ());
     }
 
-    fn begin_move(&mut self, captured: Option<(Square, Piece)>) {
+    fn begin_move(&mut self, captured: Option<(Square, Piece)>, from: Square, us: Color) {
         let prev_ep = self.ep_square;
+        let prev_castling = self.castling;
         self.ep_square = None;
-        self.history.push(Undo { captured, prev_ep });
+
+        // A king or rook moving off its home square forfeits that side's
+        // castling right, as does capturing an enemy rook on its home square.
+        let rank = castling_utils::castling_rank(us);
+        if from == Square::from((files::E, rank)) {
+            self.castling &= !(0b1100u8 >> (us.v() * 2));
+        } else if from == Square::from((files::A, rank)) {
+            self.castling &= !(0b0100u8 >> (us.v() * 2));
+        } else if from == Square::from((files::H, rank)) {
+            self.castling &= !(0b1000u8 >> (us.v() * 2));
+        }
+        if let Some((cap_sq, _)) = captured {
+            let them = !us;
+            let their_rank = castling_utils::castling_rank(them);
+            if cap_sq == Square::from((files::A, their_rank)) {
+                self.castling &= !(0b0100u8 >> (them.v() * 2));
+            } else if cap_sq == Square::from((files::H, their_rank)) {
+                self.castling &= !(0b1000u8 >> (them.v() * 2));
+            }
+        }
+
+        self.history.push(Undo { captured, prev_ep, prev_castling });
     }
 
     fn end_move(&mut self) -> Option<(Square, Piece)> {
         let undo = self.history.pop().unwrap();
         self.ep_square = undo.prev_ep;
+        self.castling = undo.prev_castling;
         undo.captured
     }
 
@@ -270,6 +295,7 @@ impl Default for Board {
         Board {
             pieces: PieceInfo::default(),
             ep_square: None,
+            castling: 0,
             history: Vec::new(),
         }
     }
@@ -307,8 +333,8 @@ mod move_flags {
     impl MoveFlag for Quiet {
         type ApplyCastling<C: Castling, T: Turn> = C;
         type ApplyEp = ep_squares::None;
-        fn make(board: &mut Board, from: Square, to: Square, _us: Color) {
-            board.begin_move(None);
+        fn make(board: &mut Board, from: Square, to: Square, us: Color) {
+            board.begin_move(None, from, us);
             board.move_piece(from, to);
         }
         fn unmake(board: &mut Board, from: Square, to: Square, _us: Color) {
@@ -320,8 +346,8 @@ mod move_flags {
     impl MoveFlag for DoublePawnPush {
         type ApplyCastling<C: Castling, T: Turn> = C;
         type ApplyEp = ep_squares::Some;
-        fn make(board: &mut Board, from: Square, to: Square, _us: Color) {
-            board.begin_move(None);
+        fn make(board: &mut Board, from: Square, to: Square, us: Color) {
+            board.begin_move(None, from, us);
             board.move_piece(from, to);
             // The capture square is the doubled pawn's destination square.
             board.ep_square = Some(to);
@@ -335,9 +361,9 @@ mod move_flags {
     impl MoveFlag for Capture {
         type ApplyCastling<C: Castling, T: Turn> = C;
         type ApplyEp = ep_squares::None;
-        fn make(board: &mut Board, from: Square, to: Square, _us: Color) {
+        fn make(board: &mut Board, from: Square, to: Square, us: Color) {
             let captured = board.remove_piece(to);
-            board.begin_move(Some((to, captured)));
+            board.begin_move(Some((to, captured)), from, us);
             board.move_piece(from, to);
         }
         fn unmake(board: &mut Board, from: Square, to: Square, _us: Color) {
@@ -353,7 +379,7 @@ mod move_flags {
         fn make(board: &mut Board, from: Square, to: Square, us: Color) {
             let cap_sq = pawn_utils::backward(Bitboard::from(to), pawn_utils::single_step(us)).lsb().unwrap();
             let captured = board.remove_piece(cap_sq);
-            board.begin_move(Some((cap_sq, captured)));
+            board.begin_move(Some((cap_sq, captured)), from, us);
             board.move_piece(from, to);
         }
         fn unmake(board: &mut Board, from: Square, to: Square, _us: Color) {
@@ -369,7 +395,7 @@ mod move_flags {
                 type ApplyCastling<C: Castling, T: Turn> = C;
                 type ApplyEp = ep_squares::None;
                 fn make(board: &mut Board, from: Square, to: Square, us: Color) {
-                    board.begin_move(None);
+                    board.begin_move(None, from, us);
                     board.remove_piece(from);
                     board.put_piece(to, Piece::from((us, $pt)));
                 }
@@ -393,7 +419,7 @@ mod move_flags {
                 type ApplyEp = ep_squares::None;
                 fn make(board: &mut Board, from: Square, to: Square, us: Color) {
                     let captured = board.remove_piece(to);
-                    board.begin_move(Some((to, captured)));
+                    board.begin_move(Some((to, captured)), from, us);
                     board.remove_piece(from);
                     board.put_piece(to, Piece::from((us, $pt)));
                 }
@@ -416,7 +442,7 @@ mod move_flags {
         type ApplyEp = ep_squares::None;
         fn make(board: &mut Board, from: Square, to: Square, us: Color) {
             let rank = castling_utils::castling_rank(us);
-            board.begin_move(None);
+            board.begin_move(None, from, us);
             board.move_piece(from, to);
             board.move_piece(Square::from((files::H, rank)), Square::from((files::F, rank)));
         }
@@ -433,7 +459,7 @@ mod move_flags {
         type ApplyEp = ep_squares::None;
         fn make(board: &mut Board, from: Square, to: Square, us: Color) {
             let rank = castling_utils::castling_rank(us);
-            board.begin_move(None);
+            board.begin_move(None, from, us);
             board.move_piece(from, to);
             board.move_piece(Square::from((files::A, rank)), Square::from((files::D, rank)));
         }
@@ -568,6 +594,7 @@ where
         checkers: Bitboard,
         blockers: Bitboard,
         ep_capture: Option<Square>,
+        castling: u8,
     }
 
     let us = T::COLOR;
@@ -608,6 +635,7 @@ where
             checkers,
             blockers,
             ep_capture: board.ep_square,
+            castling: board.castling,
         }
     };
 
@@ -784,15 +812,15 @@ where
         }
     }
 
-    // Castling (only out of check, through unattacked, empty squares). The
-    // type-level `C::RIGHTS` can go stale (a rook capture or king move isn't a
-    // castling flag, so `Next` can't clear it), so also verify the king and rook
-    // are actually on their home squares.
+    // Castling (only out of check, through unattacked, empty squares). Rights
+    // are tracked at runtime in `Board::castling` and cleared when a king or
+    // rook moves (or an enemy rook is captured on its home square); the home-
+    // square checks below are a defensive extra.
     if n_checkers == 0 {
         let rank = castling_utils::castling_rank(us);
         let home_king = Square::from((files::E, rank));
         let occ_no_king = s.occ & !Bitboard::from(s.king_sq);
-        if C::RIGHTS & (0b1000u8 >> (us.v() * 2)) != 0
+        if s.castling & (0b1000u8 >> (us.v() * 2)) != 0
             && s.king_sq == home_king
             && !(s.us[3] & Bitboard::from(Square::from((files::H, rank)))).is_empty()
         {
@@ -806,7 +834,7 @@ where
                 emit!(move_flags::KingCastle, s.king_sq, g);
             }
         }
-        if C::RIGHTS & (0b0100u8 >> (us.v() * 2)) != 0
+        if s.castling & (0b0100u8 >> (us.v() * 2)) != 0
             && s.king_sq == home_king
             && !(s.us[3] & Bitboard::from(Square::from((files::A, rank)))).is_empty()
         {
@@ -877,6 +905,8 @@ pub fn parse_fen(fen: &str) -> (Board, Side, u8) {
         let capture = pawn_utils::forward(Bitboard::from(target), opp_step).lsb().unwrap();
         board.ep_square = Some(capture);
     }
+
+    board.castling = mask;
 
     (board, side, mask)
 }

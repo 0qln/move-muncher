@@ -6,3 +6,10 @@ edition = "2024"
 [dependencies]
 engine = { path = "../../nephrid/engine" }
 ghost-cell = "0.2"
+
+[dev-dependencies]
+criterion = "0.8.2"
+
+[[bench]]
+name = "perft"
+harness = false
