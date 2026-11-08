@@ -12,6 +12,12 @@ use engine::core::{
 use ghost_cell::{GhostCell, GhostToken};
 use std::marker::PhantomData;
 
+/// Initialize the engine's global lookup tables (magic bitboards). Must be
+/// called once before `perft`.
+pub fn init() {
+    engine::core::move_iter::sliding_piece::magics::init();
+}
+
 pub trait Turn {
     type Next: Turn;
     type Prev: Turn;
@@ -23,11 +29,11 @@ pub trait Turn {
     type Castling_TakeQ<C: Castling>: Castling;
 }
 
-mod turns {
+pub mod turns {
     use super::*;
 
-    struct White;
-    struct Black;
+    pub struct White;
+    pub struct Black;
 
     impl Turn for White {
         type Next = Black;
@@ -73,7 +79,7 @@ pub trait Castling {
     type Next<M: Move, T: Turn>: Castling;
 }
 
-mod castling {
+pub mod castling {
     use super::*;
 
     macro_rules! impl_castling_states {
@@ -117,11 +123,15 @@ mod castling {
 pub trait EpSquare {
     type Next<M: Move>: EpSquare;
 }
-mod ep_squares {
-    use super::*;
-
-    struct None;
-    struct Some(Square);
+pub mod ep_squares {
+    pub struct None;
+    pub struct Some;
+}
+impl EpSquare for ep_squares::None {
+    type Next<M: Move> = <M::Flag as MoveFlag>::ApplyEp;
+}
+impl EpSquare for ep_squares::Some {
+    type Next<M: Move> = <M::Flag as MoveFlag>::ApplyEp;
 }
 
 pub trait Move: Copy {
@@ -180,26 +190,105 @@ impl Board {
         self.pieces.put_piece(sq, piece, &mut ());
     }
 
-    /// Push an undo record (clearing the en-passant square) for the move about
-    /// to be applied.
     fn begin_move(&mut self, captured: Option<(Square, Piece)>) {
         let prev_ep = self.ep_square;
         self.ep_square = None;
         self.history.push(Undo { captured, prev_ep });
     }
 
-    /// Pop the undo record, restoring the en-passant square, and return the
-    /// captured piece (if any) to be re-placed.
     fn end_move(&mut self) -> Option<(Square, Piece)> {
         let undo = self.history.pop().unwrap();
         self.ep_square = undo.prev_ep;
         undo.captured
+    }
+
+    /// Build a board from the piece-placement field of a FEN (turn, castling and
+    /// en-passant are supplied as type parameters on `Pos`, not stored here).
+    pub fn from_fen(piece_placement: &str) -> Self {
+        let mut board = Board::default();
+        let mut sq: i32 = 56; // a8
+        for c in piece_placement.chars() {
+            match c {
+                '/' => sq -= 16,
+                '1'..='8' => sq += c as i32 - '0' as i32,
+                'p' | 'n' | 'b' | 'r' | 'q' | 'k' | 'P' | 'N' | 'B' | 'R' | 'Q' | 'K' => {
+                    let color = if c.is_ascii_uppercase() { colors::WHITE } else { colors::BLACK };
+                    let pt = match c.to_ascii_lowercase() {
+                        'p' => piece_type::PAWN,
+                        'n' => piece_type::KNIGHT,
+                        'b' => piece_type::BISHOP,
+                        'r' => piece_type::ROOK,
+                        'q' => piece_type::QUEEN,
+                        _ => piece_type::KING,
+                    };
+                    // Safety: `sq` is kept within 0..64.
+                    board.pieces.put_piece(unsafe { Square::from_v(sq as u8) }, Piece::from((color, pt)), &mut ());
+                    sq += 1;
+                }
+                ' ' => break,
+                _ => {}
+            }
+        }
+        board
+    }
+
+    pub fn initial() -> Self {
+        Self::from_fen("rnbqkbnr/pppppppp/8/8/8/8/PPPPPPPP/RNBQKBNR")
+    }
+
+    pub fn to_fen(&self) -> String {
+        let mut out = String::new();
+        for rank in (0..8i32).rev() {
+            let mut empty = 0;
+            for file in 0..8i32 {
+                let sq = unsafe { Square::from_v((rank * 8 + file) as u8) };
+                let piece = self.pieces.get_piece(sq);
+                if piece == Piece::default() {
+                    empty += 1;
+                } else {
+                    if empty > 0 {
+                        out.push_str(&empty.to_string());
+                        empty = 0;
+                    }
+                    let c = match piece.piece_type() {
+                        piece_type::PAWN => 'p',
+                        piece_type::KNIGHT => 'n',
+                        piece_type::BISHOP => 'b',
+                        piece_type::ROOK => 'r',
+                        piece_type::QUEEN => 'q',
+                        piece_type::KING => 'k',
+                        _ => '?',
+                    };
+                    out.push(if piece.color() == colors::WHITE { c.to_ascii_uppercase() } else { c });
+                }
+            }
+            if empty > 0 {
+                out.push_str(&empty.to_string());
+            }
+            if rank > 0 {
+                out.push('/');
+            }
+        }
+        out
+    }
+}
+
+impl Default for Board {
+    fn default() -> Self {
+        Board {
+            pieces: PieceInfo::default(),
+            ep_square: None,
+            history: Vec::new(),
+        }
     }
 }
 
 pub trait MoveFlag {
     /// The castling state after a move carrying this flag is played.
     type Apply<C: Castling, T: Turn>: Castling;
+
+    /// The en-passant state after this move (only `DoublePawnPush` sets one).
+    type ApplyEp: EpSquare;
 
     fn make(board: &mut Board, from: Square, to: Square, us: Color);
     fn unmake(board: &mut Board, from: Square, to: Square, us: Color);
@@ -225,6 +314,7 @@ mod move_flags {
 
     impl MoveFlag for Quiet {
         type Apply<C: Castling, T: Turn> = C;
+        type ApplyEp = ep_squares::None;
         fn make(board: &mut Board, from: Square, to: Square, _us: Color) {
             board.begin_move(None);
             board.move_piece(from, to);
@@ -237,11 +327,12 @@ mod move_flags {
 
     impl MoveFlag for DoublePawnPush {
         type Apply<C: Castling, T: Turn> = C;
-        fn make(board: &mut Board, from: Square, to: Square, us: Color) {
+        type ApplyEp = ep_squares::Some;
+        fn make(board: &mut Board, from: Square, to: Square, _us: Color) {
             board.begin_move(None);
             board.move_piece(from, to);
-            let ep = pawn_utils::backward(Bitboard::from(to), pawn_utils::single_step(us)).lsb().unwrap();
-            board.ep_square = Some(ep);
+            // The capture square is the doubled pawn's destination square.
+            board.ep_square = Some(to);
         }
         fn unmake(board: &mut Board, from: Square, to: Square, _us: Color) {
             board.move_piece(to, from);
@@ -251,6 +342,7 @@ mod move_flags {
 
     impl MoveFlag for Capture {
         type Apply<C: Castling, T: Turn> = C;
+        type ApplyEp = ep_squares::None;
         fn make(board: &mut Board, from: Square, to: Square, _us: Color) {
             let captured = board.remove_piece(to);
             board.begin_move(Some((to, captured)));
@@ -265,6 +357,7 @@ mod move_flags {
 
     impl MoveFlag for EnPassant {
         type Apply<C: Castling, T: Turn> = C;
+        type ApplyEp = ep_squares::None;
         fn make(board: &mut Board, from: Square, to: Square, us: Color) {
             let cap_sq = pawn_utils::backward(Bitboard::from(to), pawn_utils::single_step(us)).lsb().unwrap();
             let captured = board.remove_piece(cap_sq);
@@ -282,6 +375,7 @@ mod move_flags {
         ($flag:ident, $pt:path) => {
             impl MoveFlag for $flag {
                 type Apply<C: Castling, T: Turn> = C;
+                type ApplyEp = ep_squares::None;
                 fn make(board: &mut Board, from: Square, to: Square, us: Color) {
                     board.begin_move(None);
                     board.remove_piece(from);
@@ -304,6 +398,7 @@ mod move_flags {
         ($flag:ident, $pt:path) => {
             impl MoveFlag for $flag {
                 type Apply<C: Castling, T: Turn> = C;
+                type ApplyEp = ep_squares::None;
                 fn make(board: &mut Board, from: Square, to: Square, us: Color) {
                     let captured = board.remove_piece(to);
                     board.begin_move(Some((to, captured)));
@@ -326,6 +421,7 @@ mod move_flags {
 
     impl MoveFlag for KingCastle {
         type Apply<C: Castling, T: Turn> = <<C as Castling>::Take_K<T> as Castling>::Take_Q<T>;
+        type ApplyEp = ep_squares::None;
         fn make(board: &mut Board, from: Square, to: Square, us: Color) {
             let rank = castling_utils::castling_rank(us);
             board.begin_move(None);
@@ -342,6 +438,7 @@ mod move_flags {
 
     impl MoveFlag for QueenCastle {
         type Apply<C: Castling, T: Turn> = <<C as Castling>::Take_K<T> as Castling>::Take_Q<T>;
+        type ApplyEp = ep_squares::None;
         fn make(board: &mut Board, from: Square, to: Square, us: Color) {
             let rank = castling_utils::castling_rank(us);
             board.begin_move(None);
@@ -357,23 +454,34 @@ mod move_flags {
     }
 }
 
-pub struct Pos<'id, Turn, Castling, EpSquare> {
+pub struct Pos<'a, 'id, Turn, Castling, EpSquare> {
     _turn: PhantomData<Turn>,
     _castling: PhantomData<Castling>,
     _ep_square: PhantomData<EpSquare>,
 
-    board: &'id GhostCell<'id, Board>,
+    board: &'a GhostCell<'id, Board>,
 }
 
-impl<T, C, Ep> Clone for Pos<'_, T, C, Ep> {
+impl<T, C, Ep> Clone for Pos<'_, '_, T, C, Ep> {
     fn clone(&self) -> Self {
         *self
     }
 }
-impl<T, C, Ep> Copy for Pos<'_, T, C, Ep> {}
+impl<T, C, Ep> Copy for Pos<'_, '_, T, C, Ep> {}
 
-impl<'id, T: Turn, C: Castling, Ep: EpSquare> Pos<'id, T, C, Ep> {
-    fn make_move<M: Move>(&self, m: M, token: &mut GhostToken<'id>) -> Pos<'id, T::Next, C::Next<M, T>, Ep::Next<M>> {
+impl<'a, 'id, T, C, Ep> Pos<'a, 'id, T, C, Ep> {
+    pub fn new(board: &'a GhostCell<'id, Board>) -> Self {
+        Pos {
+            _turn: PhantomData,
+            _castling: PhantomData,
+            _ep_square: PhantomData,
+            board,
+        }
+    }
+}
+
+impl<'a, 'id, T: Turn, C: Castling, Ep: EpSquare> Pos<'a, 'id, T, C, Ep> {
+    fn make_move<M: Move>(&self, m: M, token: &mut GhostToken<'id>) -> Pos<'a, 'id, T::Next, C::Next<M, T>, Ep::Next<M>> {
         let board = self.board.borrow_mut(token);
         <M::Flag as MoveFlag>::make(board, m.from(), m.to(), T::COLOR);
         Pos {
@@ -386,8 +494,8 @@ impl<'id, T: Turn, C: Castling, Ep: EpSquare> Pos<'id, T, C, Ep> {
 
     fn unmake_move<M: Move>(&self, m: M, token: &mut GhostToken<'id>) {
         let board = self.board.borrow_mut(token);
-        // `T` is the side to move *after* the move was made, so the mover is
-        // the previous side.
+        // `T` is the side to move *after* the move was made, so the mover is the
+        // previous side.
         <M::Flag as MoveFlag>::unmake(board, m.from(), m.to(), T::Prev::COLOR);
     }
 }
@@ -396,8 +504,8 @@ trait MoveVisitor<'id, B> {
     fn invoke<M: Move>(&mut self, acc: B, m: M, token: &mut GhostToken<'id>) -> B;
 }
 
-pub fn perft<'id, T: Turn, C: Castling, Ep: EpSquare>(
-    pos: Pos<'id, T, C, Ep>,
+pub fn perft<'a, 'id, T: Turn, C: Castling, Ep: EpSquare>(
+    pos: Pos<'a, 'id, T, C, Ep>,
     token: &mut GhostToken<'id>,
     depth: u8,
 ) -> u64 {
@@ -405,12 +513,12 @@ pub fn perft<'id, T: Turn, C: Castling, Ep: EpSquare>(
         return 1;
     }
 
-    struct Visitor<'id, T, C, Ep> {
-        pos: Pos<'id, T, C, Ep>,
+    struct Visitor<'a, 'id, T, C, Ep> {
+        pos: Pos<'a, 'id, T, C, Ep>,
         depth: u8,
     }
 
-    impl<'id, T: Turn, C: Castling, Ep: EpSquare> MoveVisitor<'id, u64> for Visitor<'id, T, C, Ep> {
+    impl<'a, 'id, T: Turn, C: Castling, Ep: EpSquare> MoveVisitor<'id, u64> for Visitor<'a, 'id, T, C, Ep> {
         fn invoke<M: Move>(&mut self, count: u64, m: M, token: &mut GhostToken<'id>) -> u64 {
             let next = self.pos.make_move(m, token);
             let count = count + perft(next, token, self.depth - 1);
@@ -422,8 +530,39 @@ pub fn perft<'id, T: Turn, C: Castling, Ep: EpSquare>(
     fold_moves(pos, 0, Visitor { pos, depth }, token)
 }
 
-fn fold_moves<'id, T: Turn, C: Castling, Ep: EpSquare, B, V>(
-    pos: Pos<'id, T, C, Ep>,
+/// Piece bitboards for `color`, in order PAWN, KNIGHT, BISHOP, ROOK, QUEEN, KING.
+fn piece_array(pieces: &PieceInfo, color: Color) -> [Bitboard; 6] {
+    [
+        pieces.get_bitboard(piece_type::PAWN, color),
+        pieces.get_bitboard(piece_type::KNIGHT, color),
+        pieces.get_bitboard(piece_type::BISHOP, color),
+        pieces.get_bitboard(piece_type::ROOK, color),
+        pieces.get_bitboard(piece_type::QUEEN, color),
+        pieces.get_bitboard(piece_type::KING, color),
+    ]
+}
+
+/// Pieces of `by` that attack `to`, given the occupancy `occ`.
+fn attackers_to(to: Square, occ: Bitboard, by: Color, p: &[Bitboard; 6]) -> Bitboard {
+    (rook::Rook::lookup_attacks(to, occ) & (p[3] | p[4]))
+        | (bishop::Bishop::lookup_attacks(to, occ) & (p[2] | p[4]))
+        | (knight::lookup_attacks(to) & p[1])
+        | (king::lookup_attacks(to) & p[5])
+        | (pawn::lookup_attacks(to, !by) & p[0])
+}
+
+/// If `sq` is pinned against our king, restrict it to the pin ray; otherwise allow
+/// everything.
+fn pin_mask(sq: Square, blockers: Bitboard, king_sq: Square) -> Bitboard {
+    if (Bitboard::from(sq) & blockers).is_empty() {
+        Bitboard::full()
+    } else {
+        Bitboard::ray(sq, king_sq)
+    }
+}
+
+fn fold_moves<'a, 'id, T: Turn, C: Castling, Ep: EpSquare, B, V>(
+    pos: Pos<'a, 'id, T, C, Ep>,
     init: B,
     mut visitor: V,
     token: &mut GhostToken<'id>,
@@ -434,35 +573,66 @@ where
     struct Snapshot {
         occ: Bitboard,
         empty: Bitboard,
-        them: Bitboard,
-        pawns: Bitboard,
-        knights: Bitboard,
-        bishops: Bitboard,
-        rooks: Bitboard,
-        queens: Bitboard,
+        us_bb: Bitboard,
+        them_bb: Bitboard,
+        us: [Bitboard; 6],
+        enemy: [Bitboard; 6],
         king_sq: Square,
+        checkers: Bitboard,
+        blockers: Bitboard,
         ep_capture: Option<Square>,
     }
 
     let us = T::COLOR;
 
-    // Snapshot the board (all `Copy`), then release the immutable borrow so the
-    // visitor can take the token mutably below.
+    // Read the board's Copy state once. GhostCell gives single-owner access, so
+    // we can't hold `&Board` while the visitor below takes the token mutably;
+    // this copies ~a dozen `u64` bitboards, not the board itself.
     let s = {
         let board = pos.board.borrow(&*token);
         let occ = board.pieces.get_occupancy();
+        let us_pieces = piece_array(&board.pieces, us);
+        let enemy = piece_array(&board.pieces, !us);
+
+        let king_sq = us_pieces[5].lsb().unwrap_or_else(|| panic!("no king for side to move ({us}); FEN: {}", board.to_fen()));
+        let checkers = attackers_to(king_sq, occ, !us, &enemy);
+
+        // X-ray blockers (pinned pieces).
+        let x_ray = (rook::lookup_attacks_0_occ(king_sq) & (enemy[3] | enemy[4]))
+            | (bishop::lookup_attacks_0_occ(king_sq) & (enemy[2] | enemy[4]));
+        let mut blockers = Bitboard::empty();
+        let mut xb = x_ray;
+        while let Some(x) = xb.pop_lsb() {
+            let between = Bitboard::between(x, king_sq);
+            if (occ & between).pop_cnt() == 1 {
+                blockers |= between;
+            }
+        }
+
         Snapshot {
             occ,
             empty: !occ,
-            them: board.pieces.get_color_bb(!us),
-            pawns: board.pieces.get_bitboard(piece_type::PAWN, us),
-            knights: board.pieces.get_bitboard(piece_type::KNIGHT, us),
-            bishops: board.pieces.get_bitboard(piece_type::BISHOP, us),
-            rooks: board.pieces.get_bitboard(piece_type::ROOK, us),
-            queens: board.pieces.get_bitboard(piece_type::QUEEN, us),
-            king_sq: board.pieces.get_bitboard(piece_type::KING, us).lsb().unwrap(),
+            us_bb: board.pieces.get_color_bb(us),
+            them_bb: board.pieces.get_color_bb(!us),
+            us: us_pieces,
+            enemy,
+            king_sq,
+            checkers,
+            blockers,
             ep_capture: board.ep_square,
         }
+    };
+
+    let n_checkers = s.checkers.pop_cnt();
+
+    // Check-resolution target masks: which squares may a quiet/capture move land on.
+    let (quiet_mask, capture_mask) = match n_checkers {
+        0 => (s.empty, s.them_bb),
+        1 => {
+            let checker = s.checkers.lsb().unwrap();
+            (Bitboard::between(s.king_sq, checker), s.checkers)
+        }
+        _ => (Bitboard::empty(), Bitboard::empty()),
     };
 
     let mut acc = init;
@@ -476,106 +646,164 @@ where
         };
     }
 
-    // Knights.
-    let mut bb = s.knights;
-    while let Some(from) = bb.pop_lsb() {
-        let targets = knight::lookup_attacks(from);
-        let mut q = targets & s.empty;
-        while let Some(to) = q.pop_lsb() { emit!(move_flags::Quiet, from, to); }
-        let mut c = targets & s.them;
-        while let Some(to) = c.pop_lsb() { emit!(move_flags::Capture, from, to); }
-    }
-
-    // King (non-castling).
-    {
-        let targets = king::lookup_attacks(s.king_sq);
-        let mut q = targets & s.empty;
-        while let Some(to) = q.pop_lsb() { emit!(move_flags::Quiet, s.king_sq, to); }
-        let mut c = targets & s.them;
-        while let Some(to) = c.pop_lsb() { emit!(move_flags::Capture, s.king_sq, to); }
-    }
-
-    // Sliders: rook-like (rooks + queens).
-    let mut bb = s.rooks | s.queens;
-    while let Some(from) = bb.pop_lsb() {
-        let targets = rook::Rook::lookup_attacks(from, s.occ);
-        let mut q = targets & s.empty;
-        while let Some(to) = q.pop_lsb() { emit!(move_flags::Quiet, from, to); }
-        let mut c = targets & s.them;
-        while let Some(to) = c.pop_lsb() { emit!(move_flags::Capture, from, to); }
-    }
-
-    // Sliders: bishop-like (bishops + queens).
-    let mut bb = s.bishops | s.queens;
-    while let Some(from) = bb.pop_lsb() {
-        let targets = bishop::Bishop::lookup_attacks(from, s.occ);
-        let mut q = targets & s.empty;
-        while let Some(to) = q.pop_lsb() { emit!(move_flags::Quiet, from, to); }
-        let mut c = targets & s.them;
-        while let Some(to) = c.pop_lsb() { emit!(move_flags::Capture, from, to); }
-    }
-
-    // Pawns.
-    let mut bb = s.pawns;
-    while let Some(from) = bb.pop_lsb() {
-        let from_bb = Bitboard::from(from);
-        let promo = !(from_bb & promo_bb).is_empty();
-
-        // Single push.
-        let push = pawn_utils::forward(from_bb, step) & s.empty;
-        if let Some(to) = push.lsb() {
-            if promo {
-                emit!(move_flags::PromotionKnight, from, to);
-                emit!(move_flags::PromotionBishop, from, to);
-                emit!(move_flags::PromotionRook, from, to);
-                emit!(move_flags::PromotionQueen, from, to);
-            } else {
-                emit!(move_flags::Quiet, from, to);
-            }
+    // Non-king pieces (no moves resolve a double check).
+    if n_checkers <= 1 {
+        // Knights.
+        let mut bb = s.us[1];
+        while let Some(from) = bb.pop_lsb() {
+            let mask = pin_mask(from, s.blockers, s.king_sq);
+            let targets = knight::lookup_attacks(from) & mask;
+            let mut q = targets & quiet_mask;
+            while let Some(to) = q.pop_lsb() { emit!(move_flags::Quiet, from, to); }
+            let mut c = targets & capture_mask;
+            while let Some(to) = c.pop_lsb() { emit!(move_flags::Capture, from, to); }
         }
 
-        // Double push.
-        if !(from_bb & start_bb).is_empty() {
-            let dbl = pawn_utils::forward(push, step) & s.empty;
-            if let Some(to) = dbl.lsb() {
-                emit!(move_flags::DoublePawnPush, from, to);
-            }
+        // Rook-like sliders (rooks + queens).
+        let mut bb = s.us[3] | s.us[4];
+        while let Some(from) = bb.pop_lsb() {
+            let mask = pin_mask(from, s.blockers, s.king_sq);
+            let targets = rook::Rook::lookup_attacks(from, s.occ) & mask;
+            let mut q = targets & quiet_mask;
+            while let Some(to) = q.pop_lsb() { emit!(move_flags::Quiet, from, to); }
+            let mut c = targets & capture_mask;
+            while let Some(to) = c.pop_lsb() { emit!(move_flags::Capture, from, to); }
         }
 
-        // Captures.
-        let mut caps = pawn::lookup_attacks(from, us) & s.them;
-        while let Some(to) = caps.pop_lsb() {
-            if promo {
-                emit!(move_flags::CapturePromotionKnight, from, to);
-                emit!(move_flags::CapturePromotionBishop, from, to);
-                emit!(move_flags::CapturePromotionRook, from, to);
-                emit!(move_flags::CapturePromotionQueen, from, to);
-            } else {
-                emit!(move_flags::Capture, from, to);
-            }
+        // Bishop-like sliders (bishops + queens).
+        let mut bb = s.us[2] | s.us[4];
+        while let Some(from) = bb.pop_lsb() {
+            let mask = pin_mask(from, s.blockers, s.king_sq);
+            let targets = bishop::Bishop::lookup_attacks(from, s.occ) & mask;
+            let mut q = targets & quiet_mask;
+            while let Some(to) = q.pop_lsb() { emit!(move_flags::Quiet, from, to); }
+            let mut c = targets & capture_mask;
+            while let Some(to) = c.pop_lsb() { emit!(move_flags::Capture, from, to); }
         }
 
-        // En passant.
-        if let Some(cap) = s.ep_capture {
-            if !(pawn::lookup_attacks(from, us) & Bitboard::from(cap)).is_empty() {
+        // Pawns.
+        let mut bb = s.us[0];
+        while let Some(from) = bb.pop_lsb() {
+            let from_bb = Bitboard::from(from);
+            let mask = pin_mask(from, s.blockers, s.king_sq);
+            let promo = !(from_bb & promo_bb).is_empty();
+
+            // Single push.
+            let push = pawn_utils::forward(from_bb, step) & quiet_mask & mask;
+            if let Some(to) = push.lsb() {
+                if promo {
+                    emit!(move_flags::PromotionKnight, from, to);
+                    emit!(move_flags::PromotionBishop, from, to);
+                    emit!(move_flags::PromotionRook, from, to);
+                    emit!(move_flags::PromotionQueen, from, to);
+                } else {
+                    emit!(move_flags::Quiet, from, to);
+                }
+            }
+
+            // Double push: the middle square just needs to be empty; the
+            // destination must satisfy the quiet/block mask (and not be pinned).
+            if !(from_bb & start_bb).is_empty() {
+                let middle = pawn_utils::forward(from_bb, step);
+                if (middle & s.occ).is_empty() {
+                    let dbl = pawn_utils::forward(middle, step) & quiet_mask & mask;
+                    if let Some(to) = dbl.lsb() {
+                        emit!(move_flags::DoublePawnPush, from, to);
+                    }
+                }
+            }
+
+            // Captures.
+            let mut caps = pawn::lookup_attacks(from, us) & capture_mask & mask;
+            while let Some(to) = caps.pop_lsb() {
+                if promo {
+                    emit!(move_flags::CapturePromotionKnight, from, to);
+                    emit!(move_flags::CapturePromotionBishop, from, to);
+                    emit!(move_flags::CapturePromotionRook, from, to);
+                    emit!(move_flags::CapturePromotionQueen, from, to);
+                } else {
+                    emit!(move_flags::Capture, from, to);
+                }
+            }
+
+            // En passant (with the ep-pin legality check). `cap` is the capture
+            // square (the enemy pawn); `tgt` is where our pawn lands.
+            if let Some(cap) = s.ep_capture {
                 let tgt = pawn_utils::forward(Bitboard::from(cap), step).lsb().unwrap();
-                emit!(move_flags::EnPassant, from, tgt);
+                if !(pawn::lookup_attacks(from, us) & Bitboard::from(tgt)).is_empty() {
+                    let legal = {
+                        let board = pos.board.borrow_mut(token);
+                        let captured = board.remove_piece(cap);
+                        board.move_piece(from, tgt);
+                        let occ_after = board.pieces.get_occupancy();
+                        let enemy_after = piece_array(&board.pieces, !us);
+                        let legal = attackers_to(s.king_sq, occ_after, !us, &enemy_after).is_empty();
+                        board.move_piece(tgt, from);
+                        board.put_piece(cap, captured);
+                        legal
+                    };
+                    if legal {
+                        emit!(move_flags::EnPassant, from, tgt);
+                    }
+                }
             }
         }
     }
 
-    // Castling.
-    let rank = castling_utils::castling_rank(us);
-    if C::RIGHTS & (0b1000u8 >> (us.v() * 2)) != 0 {
-        let path = Bitboard::between(s.king_sq, Square::from((files::H, rank)));
-        if (path & s.occ).is_empty() {
-            emit!(move_flags::KingCastle, s.king_sq, Square::from((files::G, rank)));
+    // King moves (always legal to try; filter attacked destination squares).
+    {
+        let occ_no_king = s.occ & !Bitboard::from(s.king_sq);
+        let targets = king::lookup_attacks(s.king_sq) & !s.us_bb;
+        let mut q = targets & s.empty;
+        while let Some(to) = q.pop_lsb() {
+            if attackers_to(to, occ_no_king, !us, &s.enemy).is_empty() {
+                emit!(move_flags::Quiet, s.king_sq, to);
+            }
+        }
+        let mut c = targets & s.them_bb;
+        while let Some(to) = c.pop_lsb() {
+            if attackers_to(to, occ_no_king, !us, &s.enemy).is_empty() {
+                emit!(move_flags::Capture, s.king_sq, to);
+            }
         }
     }
-    if C::RIGHTS & (0b0100u8 >> (us.v() * 2)) != 0 {
-        let path = Bitboard::between(s.king_sq, Square::from((files::A, rank)));
-        if (path & s.occ).is_empty() {
-            emit!(move_flags::QueenCastle, s.king_sq, Square::from((files::C, rank)));
+
+    // Castling (only out of check, through unattacked, empty squares). The
+    // type-level `C::RIGHTS` can go stale (a rook capture or king move isn't a
+    // castling flag, so `Next` can't clear it), so also verify the king and rook
+    // are actually on their home squares.
+    if n_checkers == 0 {
+        let rank = castling_utils::castling_rank(us);
+        let home_king = Square::from((files::E, rank));
+        let occ_no_king = s.occ & !Bitboard::from(s.king_sq);
+        if C::RIGHTS & (0b1000u8 >> (us.v() * 2)) != 0
+            && s.king_sq == home_king
+            && !(s.us[3] & Bitboard::from(Square::from((files::H, rank)))).is_empty()
+        {
+            let f = Square::from((files::F, rank));
+            let g = Square::from((files::G, rank));
+            let path = Bitboard::from(f) | Bitboard::from(g);
+            if (path & s.occ).is_empty()
+                && attackers_to(f, occ_no_king, !us, &s.enemy).is_empty()
+                && attackers_to(g, occ_no_king, !us, &s.enemy).is_empty()
+            {
+                emit!(move_flags::KingCastle, s.king_sq, g);
+            }
+        }
+        if C::RIGHTS & (0b0100u8 >> (us.v() * 2)) != 0
+            && s.king_sq == home_king
+            && !(s.us[3] & Bitboard::from(Square::from((files::A, rank)))).is_empty()
+        {
+            let d = Square::from((files::D, rank));
+            let c = Square::from((files::C, rank));
+            let b = Square::from((files::B, rank));
+            let path = Bitboard::from(d) | Bitboard::from(c) | Bitboard::from(b);
+            if (path & s.occ).is_empty()
+                && attackers_to(d, occ_no_king, !us, &s.enemy).is_empty()
+                && attackers_to(c, occ_no_king, !us, &s.enemy).is_empty()
+            {
+                emit!(move_flags::QueenCastle, s.king_sq, c);
+            }
         }
     }
 
