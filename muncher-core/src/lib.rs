@@ -3,26 +3,26 @@
 
 use engine::core::{
     bitboard::Bitboard,
-    color::{colors, Color},
-    coordinates::{castling as castling_utils, files, pawn_utils, Square},
-    move_iter::{bishop, king, knight, pawn, rook, sliding_piece::SlidingAttacks},
-    piece::{piece_type, Piece},
+    color::{Color, colors},
+    coordinates::{Square, castling as castling_utils, files, pawn_utils},
+    move_iter::{
+        bishop, king, knight, pawn, rook,
+        sliding_piece::{SlidingAttacks, magics},
+    },
+    piece::{Piece, piece_type},
     position::PieceInfo,
 };
 use ghost_cell::{GhostCell, GhostToken};
 use std::marker::PhantomData;
 
-/// Initialize the engine's global lookup tables (magic bitboards). Must be
-/// called once before `perft`.
 pub fn init() {
-    engine::core::move_iter::sliding_piece::magics::init();
+    magics::init();
 }
 
 pub trait Turn {
     type Next: Turn;
     type Prev: Turn;
 
-    /// The runtime color this turn represents.
     const COLOR: Color;
 
     type Castling_TakeK<C: Castling>: Castling;
@@ -54,28 +54,20 @@ pub mod turns {
     }
 }
 
+/// KING_WHITE=0b1000, QUEEN_WHITE=0b0100, KING_BLACK=0b0010, QUEEN_BLACK=0b0001.
 #[allow(non_camel_case_types)]
 pub trait Castling {
-    /// The next castling state without KING_WHITE.
     type Take_1000: Castling;
-
-    /// The next castling state without QUEEN_WHITE.
     type Take_0100: Castling;
-
-    /// The next castling state without KING_BLACK.
     type Take_0010: Castling;
-
-    /// The next castling state without QUEEN_BLACK.
     type Take_0001: Castling;
 
-    /// The runtime castling-rights bitmask:
-    /// KING_WHITE=0b1000, QUEEN_WHITE=0b0100, KING_BLACK=0b0010, QUEEN_BLACK=0b0001.
     const RIGHTS: u8;
 
     type Take_Q<T: Turn>: Castling;
     type Take_K<T: Turn>: Castling;
 
-    /// The next castling state after a move whose flag is `M::Flag` is played.
+    /// The next castling state after a move M is played.
     type Next<M: Move, T: Turn>: Castling;
 }
 
@@ -94,7 +86,7 @@ pub mod castling {
                     const RIGHTS: u8 = $rights;
                     type Take_K<T: Turn> = <T as Turn>::Castling_TakeK<Self>;
                     type Take_Q<T: Turn> = <T as Turn>::Castling_TakeQ<Self>;
-                    type Next<M: Move, T: Turn> = <M::Flag as MoveFlag>::Apply<Self, T>;
+                    type Next<M: Move, T: Turn> = <M::Flag as MoveFlag>::ApplyCastling<Self, T>;
                 }
             )*
         };
@@ -141,8 +133,6 @@ pub trait Move: Copy {
     fn to(&self) -> Square;
 }
 
-/// A move value carrying its from/to squares, with the flag encoded at the
-/// type level so transitions like `Castling::Next<M, T>` see it statically.
 pub struct MoveValue<F: MoveFlag> {
     pub from: Square,
     pub to: Square,
@@ -222,7 +212,9 @@ impl Board {
                         _ => piece_type::KING,
                     };
                     // Safety: `sq` is kept within 0..64.
-                    board.pieces.put_piece(unsafe { Square::from_v(sq as u8) }, Piece::from((color, pt)), &mut ());
+                    board
+                        .pieces
+                        .put_piece(unsafe { Square::from_v(sq as u8) }, Piece::from((color, pt)), &mut ());
                     sq += 1;
                 }
                 ' ' => break,
@@ -285,9 +277,9 @@ impl Default for Board {
 
 pub trait MoveFlag {
     /// The castling state after a move carrying this flag is played.
-    type Apply<C: Castling, T: Turn>: Castling;
+    type ApplyCastling<C: Castling, T: Turn>: Castling;
 
-    /// The en-passant state after this move (only `DoublePawnPush` sets one).
+    /// The en-passant state after this move.
     type ApplyEp: EpSquare;
 
     fn make(board: &mut Board, from: Square, to: Square, us: Color);
@@ -313,7 +305,7 @@ mod move_flags {
     pub struct EnPassant;
 
     impl MoveFlag for Quiet {
-        type Apply<C: Castling, T: Turn> = C;
+        type ApplyCastling<C: Castling, T: Turn> = C;
         type ApplyEp = ep_squares::None;
         fn make(board: &mut Board, from: Square, to: Square, _us: Color) {
             board.begin_move(None);
@@ -326,7 +318,7 @@ mod move_flags {
     }
 
     impl MoveFlag for DoublePawnPush {
-        type Apply<C: Castling, T: Turn> = C;
+        type ApplyCastling<C: Castling, T: Turn> = C;
         type ApplyEp = ep_squares::Some;
         fn make(board: &mut Board, from: Square, to: Square, _us: Color) {
             board.begin_move(None);
@@ -341,7 +333,7 @@ mod move_flags {
     }
 
     impl MoveFlag for Capture {
-        type Apply<C: Castling, T: Turn> = C;
+        type ApplyCastling<C: Castling, T: Turn> = C;
         type ApplyEp = ep_squares::None;
         fn make(board: &mut Board, from: Square, to: Square, _us: Color) {
             let captured = board.remove_piece(to);
@@ -356,7 +348,7 @@ mod move_flags {
     }
 
     impl MoveFlag for EnPassant {
-        type Apply<C: Castling, T: Turn> = C;
+        type ApplyCastling<C: Castling, T: Turn> = C;
         type ApplyEp = ep_squares::None;
         fn make(board: &mut Board, from: Square, to: Square, us: Color) {
             let cap_sq = pawn_utils::backward(Bitboard::from(to), pawn_utils::single_step(us)).lsb().unwrap();
@@ -374,7 +366,7 @@ mod move_flags {
     macro_rules! impl_promo {
         ($flag:ident, $pt:path) => {
             impl MoveFlag for $flag {
-                type Apply<C: Castling, T: Turn> = C;
+                type ApplyCastling<C: Castling, T: Turn> = C;
                 type ApplyEp = ep_squares::None;
                 fn make(board: &mut Board, from: Square, to: Square, us: Color) {
                     board.begin_move(None);
@@ -397,7 +389,7 @@ mod move_flags {
     macro_rules! impl_capture_promo {
         ($flag:ident, $pt:path) => {
             impl MoveFlag for $flag {
-                type Apply<C: Castling, T: Turn> = C;
+                type ApplyCastling<C: Castling, T: Turn> = C;
                 type ApplyEp = ep_squares::None;
                 fn make(board: &mut Board, from: Square, to: Square, us: Color) {
                     let captured = board.remove_piece(to);
@@ -420,7 +412,7 @@ mod move_flags {
     impl_capture_promo!(CapturePromotionQueen, piece_type::QUEEN);
 
     impl MoveFlag for KingCastle {
-        type Apply<C: Castling, T: Turn> = <<C as Castling>::Take_K<T> as Castling>::Take_Q<T>;
+        type ApplyCastling<C: Castling, T: Turn> = <<C as Castling>::Take_K<T> as Castling>::Take_Q<T>;
         type ApplyEp = ep_squares::None;
         fn make(board: &mut Board, from: Square, to: Square, us: Color) {
             let rank = castling_utils::castling_rank(us);
@@ -437,7 +429,7 @@ mod move_flags {
     }
 
     impl MoveFlag for QueenCastle {
-        type Apply<C: Castling, T: Turn> = <<C as Castling>::Take_K<T> as Castling>::Take_Q<T>;
+        type ApplyCastling<C: Castling, T: Turn> = <<C as Castling>::Take_K<T> as Castling>::Take_Q<T>;
         type ApplyEp = ep_squares::None;
         fn make(board: &mut Board, from: Square, to: Square, us: Color) {
             let rank = castling_utils::castling_rank(us);
@@ -494,8 +486,7 @@ impl<'a, 'id, T: Turn, C: Castling, Ep: EpSquare> Pos<'a, 'id, T, C, Ep> {
 
     fn unmake_move<M: Move>(&self, m: M, token: &mut GhostToken<'id>) {
         let board = self.board.borrow_mut(token);
-        // `T` is the side to move *after* the move was made, so the mover is the
-        // previous side.
+        // `T` is the side to move after the move was made, so the mover is the previous side.
         <M::Flag as MoveFlag>::unmake(board, m.from(), m.to(), T::Prev::COLOR);
     }
 }
@@ -504,21 +495,17 @@ trait MoveVisitor<'id, B> {
     fn invoke<M: Move>(&mut self, acc: B, m: M, token: &mut GhostToken<'id>) -> B;
 }
 
-pub fn perft<'a, 'id, T: Turn, C: Castling, Ep: EpSquare>(
-    pos: Pos<'a, 'id, T, C, Ep>,
-    token: &mut GhostToken<'id>,
-    depth: u8,
-) -> u64 {
+pub fn perft<'a, 'id, T: Turn, C: Castling, Ep: EpSquare>(pos: Pos<'a, 'id, T, C, Ep>, token: &mut GhostToken<'id>, depth: u8) -> u64 {
     if depth == 0 {
         return 1;
     }
 
-    struct Visitor<'a, 'id, T, C, Ep> {
+    struct Counter<'a, 'id, T, C, Ep> {
         pos: Pos<'a, 'id, T, C, Ep>,
         depth: u8,
     }
 
-    impl<'a, 'id, T: Turn, C: Castling, Ep: EpSquare> MoveVisitor<'id, u64> for Visitor<'a, 'id, T, C, Ep> {
+    impl<'a, 'id, T: Turn, C: Castling, Ep: EpSquare> MoveVisitor<'id, u64> for Counter<'a, 'id, T, C, Ep> {
         fn invoke<M: Move>(&mut self, count: u64, m: M, token: &mut GhostToken<'id>) -> u64 {
             let next = self.pos.make_move(m, token);
             let count = count + perft(next, token, self.depth - 1);
@@ -527,7 +514,7 @@ pub fn perft<'a, 'id, T: Turn, C: Castling, Ep: EpSquare>(
         }
     }
 
-    fold_moves(pos, 0, Visitor { pos, depth }, token)
+    fold_moves(pos, 0, Counter { pos, depth }, token)
 }
 
 /// Piece bitboards for `color`, in order PAWN, KNIGHT, BISHOP, ROOK, QUEEN, KING.
@@ -589,17 +576,18 @@ where
     // we can't hold `&Board` while the visitor below takes the token mutably;
     // this copies ~a dozen `u64` bitboards, not the board itself.
     let s = {
-        let board = pos.board.borrow(&*token);
+        let board = pos.board.borrow(token);
         let occ = board.pieces.get_occupancy();
         let us_pieces = piece_array(&board.pieces, us);
         let enemy = piece_array(&board.pieces, !us);
 
-        let king_sq = us_pieces[5].lsb().unwrap_or_else(|| panic!("no king for side to move ({us}); FEN: {}", board.to_fen()));
+        let king_sq = us_pieces[5]
+            .lsb()
+            .unwrap_or_else(|| panic!("no king for side to move ({us}); FEN: {}", board.to_fen()));
         let checkers = attackers_to(king_sq, occ, !us, &enemy);
 
         // X-ray blockers (pinned pieces).
-        let x_ray = (rook::lookup_attacks_0_occ(king_sq) & (enemy[3] | enemy[4]))
-            | (bishop::lookup_attacks_0_occ(king_sq) & (enemy[2] | enemy[4]));
+        let x_ray = (rook::lookup_attacks_0_occ(king_sq) & (enemy[3] | enemy[4])) | (bishop::lookup_attacks_0_occ(king_sq) & (enemy[2] | enemy[4]));
         let mut blockers = Bitboard::empty();
         let mut xb = x_ray;
         while let Some(x) = xb.pop_lsb() {
@@ -642,48 +630,76 @@ where
 
     macro_rules! emit {
         ($flag:ty, $from:expr, $to:expr) => {
-            acc = visitor.invoke(acc, MoveValue::<$flag> { from: $from, to: $to, _flag: PhantomData }, token);
+            acc = visitor.invoke(
+                acc,
+                MoveValue::<$flag> {
+                    from: $from,
+                    to: $to,
+                    _flag: PhantomData,
+                },
+                token,
+            );
         };
     }
 
     // Non-king pieces (no moves resolve a double check).
     if n_checkers <= 1 {
         // Knights.
-        let mut bb = s.us[1];
-        while let Some(from) = bb.pop_lsb() {
+        let knights = s.us[1];
+        for from in knights {
             let mask = pin_mask(from, s.blockers, s.king_sq);
             let targets = knight::lookup_attacks(from) & mask;
-            let mut q = targets & quiet_mask;
-            while let Some(to) = q.pop_lsb() { emit!(move_flags::Quiet, from, to); }
-            let mut c = targets & capture_mask;
-            while let Some(to) = c.pop_lsb() { emit!(move_flags::Capture, from, to); }
+
+            let quiets = targets & quiet_mask;
+            for to in quiets {
+                emit!(move_flags::Quiet, from, to);
+            }
+
+            let captures = targets & capture_mask;
+            for to in captures {
+                emit!(move_flags::Capture, from, to);
+            }
         }
 
         // Rook-like sliders (rooks + queens).
-        let mut bb = s.us[3] | s.us[4];
-        while let Some(from) = bb.pop_lsb() {
+        // TODO: deduplicate the pin_mask computation for the queens
+        let r_n_q = s.us[3] | s.us[4];
+        for from in r_n_q {
             let mask = pin_mask(from, s.blockers, s.king_sq);
             let targets = rook::Rook::lookup_attacks(from, s.occ) & mask;
-            let mut q = targets & quiet_mask;
-            while let Some(to) = q.pop_lsb() { emit!(move_flags::Quiet, from, to); }
-            let mut c = targets & capture_mask;
-            while let Some(to) = c.pop_lsb() { emit!(move_flags::Capture, from, to); }
+
+            let quiets = targets & quiet_mask;
+            for to in quiets {
+                emit!(move_flags::Quiet, from, to);
+            }
+
+            let captures = targets & capture_mask;
+            for to in captures {
+                emit!(move_flags::Capture, from, to);
+            }
         }
 
         // Bishop-like sliders (bishops + queens).
-        let mut bb = s.us[2] | s.us[4];
-        while let Some(from) = bb.pop_lsb() {
+        let b_n_q = s.us[2] | s.us[4];
+        for from in b_n_q {
             let mask = pin_mask(from, s.blockers, s.king_sq);
             let targets = bishop::Bishop::lookup_attacks(from, s.occ) & mask;
-            let mut q = targets & quiet_mask;
-            while let Some(to) = q.pop_lsb() { emit!(move_flags::Quiet, from, to); }
-            let mut c = targets & capture_mask;
-            while let Some(to) = c.pop_lsb() { emit!(move_flags::Capture, from, to); }
+
+            let quiets = targets & quiet_mask;
+            for to in quiets {
+                emit!(move_flags::Quiet, from, to);
+            }
+
+            let captures = targets & capture_mask;
+            for to in captures {
+                emit!(move_flags::Capture, from, to);
+            }
         }
 
         // Pawns.
-        let mut bb = s.us[0];
-        while let Some(from) = bb.pop_lsb() {
+        // TODO: move all pawns at once
+        let pawns = s.us[0];
+        for from in pawns {
             let from_bb = Bitboard::from(from);
             let mask = pin_mask(from, s.blockers, s.king_sq);
             let promo = !(from_bb & promo_bb).is_empty();
@@ -750,18 +766,18 @@ where
         }
     }
 
-    // King moves (always legal to try; filter attacked destination squares).
+    // King moves
     {
         let occ_no_king = s.occ & !Bitboard::from(s.king_sq);
         let targets = king::lookup_attacks(s.king_sq) & !s.us_bb;
-        let mut q = targets & s.empty;
-        while let Some(to) = q.pop_lsb() {
+        let quiets = targets & s.empty;
+        for to in quiets {
             if attackers_to(to, occ_no_king, !us, &s.enemy).is_empty() {
                 emit!(move_flags::Quiet, s.king_sq, to);
             }
         }
-        let mut c = targets & s.them_bb;
-        while let Some(to) = c.pop_lsb() {
+        let captures = targets & s.them_bb;
+        for to in captures {
             if attackers_to(to, occ_no_king, !us, &s.enemy).is_empty() {
                 emit!(move_flags::Capture, s.king_sq, to);
             }
@@ -808,4 +824,133 @@ where
     }
 
     acc
+}
+
+/// Runtime side to move, used only to parse a FEN; the type-level `Turn` carries
+/// the actual side through `perft`.
+#[derive(Clone, Copy, PartialEq, Eq)]
+pub enum Side {
+    White,
+    Black,
+}
+
+fn parse_square(s: &str) -> Square {
+    let b = s.as_bytes();
+    let file = (b[0] - b'a') as u8;
+    let rank = (b[1] - b'1') as u8;
+    // Safety: `file` and `rank` are each in 0..8, so the index is in 0..64.
+    unsafe { Square::from_v(rank * 8 + file) }
+}
+
+/// Parse a FEN into a board, the side to move, and the castling-rights bitmask.
+pub fn parse_fen(fen: &str) -> (Board, Side, u8) {
+    let mut board = Board::from_fen(fen); // parses piece placement, stops at the first space
+
+    let mut fields = fen.split_whitespace();
+    let _ = fields.next(); // pieces (already parsed by `Board::from_fen`)
+    let turn = fields.next().unwrap_or("w");
+    let castling = fields.next().unwrap_or("-");
+    let ep = fields.next().unwrap_or("-");
+
+    let side = if turn == "w" { Side::White } else { Side::Black };
+
+    let mut mask = 0u8;
+    for c in castling.chars() {
+        mask |= match c {
+            'K' => 0b1000,
+            'Q' => 0b0100,
+            'k' => 0b0010,
+            'q' => 0b0001,
+            _ => 0,
+        };
+    }
+
+    if ep != "-" {
+        // FEN records the ep *target*; we store the *capture* square, one step
+        // beyond the target in the opponent's direction.
+        let target = parse_square(ep);
+        let opp_step = if side == Side::White {
+            pawn_utils::single_step(colors::BLACK)
+        } else {
+            pawn_utils::single_step(colors::WHITE)
+        };
+        let capture = pawn_utils::forward(Bitboard::from(target), opp_step).lsb().unwrap();
+        board.ep_square = Some(capture);
+    }
+
+    (board, side, mask)
+}
+
+macro_rules! perft_fen_dispatch {
+    ($cell:expr, $token:expr, $depth:expr, $side:expr, $castling:expr) => {
+        perft_fen_dispatch!(@arm $cell, $token, $depth, $side, $castling;
+            (_0000, 0b0000), (_0001, 0b0001), (_0010, 0b0010), (_0011, 0b0011),
+            (_0100, 0b0100), (_0101, 0b0101), (_0110, 0b0110), (_0111, 0b0111),
+            (_1000, 0b1000), (_1001, 0b1001), (_1010, 0b1010), (_1011, 0b1011),
+            (_1100, 0b1100), (_1101, 0b1101), (_1110, 0b1110), (_1111, 0b1111))
+    };
+    (@arm $cell:expr, $token:expr, $depth:expr, $side:expr, $castling:expr; $(($st:ident, $mask:literal)),* $(,)?) => {{
+        match ($side, $castling) {
+            $(
+                (Side::White, $mask) => perft(Pos::<turns::White, castling::$st, ep_squares::None>::new($cell), $token, $depth),
+                (Side::Black, $mask) => perft(Pos::<turns::Black, castling::$st, ep_squares::None>::new($cell), $token, $depth),
+            )*
+            _ => unreachable!("invalid castling mask"),
+        }
+    }};
+}
+
+/// Run perft from an arbitrary FEN string.
+pub fn perft_fen(fen: &str, depth: u8) -> u64 {
+    let (board, side, castling) = parse_fen(fen);
+    GhostToken::new(|mut token| {
+        let cell = GhostCell::new(board);
+        perft_fen_dispatch!(&cell, &mut token, depth, side, castling)
+    })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn assert_perft(fen: &str, depth: u8, expected: u64) {
+        init();
+        assert_eq!(
+            perft_fen(fen, depth),
+            expected,
+            "perft({depth}) mismatch for {fen}"
+        );
+    }
+
+    // The six standard perft positions (same set nephrid uses in
+    // `engine/src/core/move_iter/test.rs`), with the canonical node counts.
+    #[test]
+    fn perft_start_position() {
+        assert_perft("rnbqkbnr/pppppppp/8/8/8/8/PPPPPPPP/RNBQKBNR w KQkq - 0 1", 5, 4_865_609);
+    }
+
+    #[test]
+    fn perft_kiwipete() {
+        assert_perft("r3k2r/p1ppqpb1/bn2pnp1/3PN3/1p2P3/2N2Q1p/PPPBBPPP/R3K2R w KQkq - 0 1", 5, 193_690_690);
+    }
+
+    #[test]
+    fn perft_position_3() {
+        assert_perft("8/2p5/3p4/KP5r/1R3p1k/8/4P1P1/8 w - - 0 1", 6, 11_030_083);
+    }
+
+    #[test]
+    fn perft_position_4() {
+        assert_perft("r3k2r/Pppp1ppp/1b3nbN/nP6/BBP1P3/q4N2/Pp1P2PP/R2Q1RK1 w kq - 0 1", 5, 15_833_292);
+    }
+
+    #[test]
+    fn perft_position_5() {
+        assert_perft("rnbq1k1r/pp1Pbppp/2p5/8/2B5/8/PPP1NnPP/RNBQK2R w KQ - 1 8", 5, 89_941_194);
+    }
+
+    #[test]
+    fn perft_position_6() {
+        assert_perft("r4rk1/1pp1qppp/p1np1n2/2b1p1B1/2B1P1b1/P1NP1N2/1PP1QPPP/R4RK1 w - - 0 10", 5, 164_075_551);
+    }
 }

@@ -3724,7 +3724,6 @@ name = "muncher"
 version = "0.1.0"
 dependencies = [
  "clap",
- "ghost-cell",
  "muncher_core",
 ]
 
