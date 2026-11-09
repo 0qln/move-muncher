@@ -127,6 +127,11 @@ pub mod castling {
 
 pub trait EpSquare {
     type Next<M: Move>: EpSquare;
+
+    /// Whether an en-passant capture is available in this position. A
+    /// compile-time constant, so move generation branches on it without any
+    /// runtime check.
+    const AVAILABLE: bool;
 }
 pub mod ep_squares {
     pub struct None;
@@ -134,9 +139,11 @@ pub mod ep_squares {
 }
 impl EpSquare for ep_squares::None {
     type Next<M: Move> = <M::Flag as MoveFlag>::ApplyEp;
+    const AVAILABLE: bool = false;
 }
 impl EpSquare for ep_squares::Some {
     type Next<M: Move> = <M::Flag as MoveFlag>::ApplyEp;
+    const AVAILABLE: bool = true;
 }
 
 pub trait Move: Copy {
@@ -790,22 +797,26 @@ where
 
             // En passant (with the ep-pin legality check). `cap` is the capture
             // square (the enemy pawn); `tgt` is where our pawn lands.
-            if let Some(cap) = s.ep_capture {
-                let tgt = pawn_utils::forward(Bitboard::from(cap), step).lsb().unwrap();
-                if !(pawn::lookup_attacks(from, us) & Bitboard::from(tgt)).is_empty() {
-                    let legal = {
-                        let board = pos.board.borrow_mut(token);
-                        let captured = board.remove_piece(cap);
-                        board.move_piece(from, tgt);
-                        let occ_after = board.pieces.get_occupancy();
-                        let enemy_after = piece_array(&board.pieces, !us);
-                        let legal = attackers_to(s.king_sq, occ_after, !us, &enemy_after).is_empty();
-                        board.move_piece(tgt, from);
-                        board.put_piece(cap, captured);
-                        legal
-                    };
-                    if legal {
-                        emit!(move_flags::EnPassant, from, tgt);
+            // `Ep::AVAILABLE` is a compile-time constant, so this whole block is
+            // eliminated when the position has no en-passant square.
+            if Ep::AVAILABLE {
+                if let Some(cap) = s.ep_capture {
+                    let tgt = pawn_utils::forward(Bitboard::from(cap), step).lsb().unwrap();
+                    if !(pawn::lookup_attacks(from, us) & Bitboard::from(tgt)).is_empty() {
+                        let legal = {
+                            let board = pos.board.borrow_mut(token);
+                            let captured = board.remove_piece(cap);
+                            board.move_piece(from, tgt);
+                            let occ_after = board.pieces.get_occupancy();
+                            let enemy_after = piece_array(&board.pieces, !us);
+                            let legal = attackers_to(s.king_sq, occ_after, !us, &enemy_after).is_empty();
+                            board.move_piece(tgt, from);
+                            board.put_piece(cap, captured);
+                            legal
+                        };
+                        if legal {
+                            emit!(move_flags::EnPassant, from, tgt);
+                        }
                     }
                 }
             }
@@ -930,18 +941,18 @@ pub fn parse_fen(fen: &str) -> (Board, Side, u8) {
 }
 
 macro_rules! perft_fen_dispatch {
-    ($cell:expr, $token:expr, $depth:expr, $side:expr, $castling:expr) => {
-        perft_fen_dispatch!(@arm $cell, $token, $depth, $side, $castling;
+    ($cell:expr, $token:expr, $depth:expr, $side:expr, $castling:expr, $ep:ty) => {
+        perft_fen_dispatch!(@arm $cell, $token, $depth, $side, $castling, $ep;
             (_0000, 0b0000), (_0001, 0b0001), (_0010, 0b0010), (_0011, 0b0011),
             (_0100, 0b0100), (_0101, 0b0101), (_0110, 0b0110), (_0111, 0b0111),
             (_1000, 0b1000), (_1001, 0b1001), (_1010, 0b1010), (_1011, 0b1011),
             (_1100, 0b1100), (_1101, 0b1101), (_1110, 0b1110), (_1111, 0b1111))
     };
-    (@arm $cell:expr, $token:expr, $depth:expr, $side:expr, $castling:expr; $(($st:ident, $mask:literal)),* $(,)?) => {{
+    (@arm $cell:expr, $token:expr, $depth:expr, $side:expr, $castling:expr, $ep:ty; $(($st:ident, $mask:literal)),* $(,)?) => {{
         match ($side, $castling) {
             $(
-                (Side::White, $mask) => perft(Pos::<turns::White, castling::$st, ep_squares::None>::new($cell), $token, $depth),
-                (Side::Black, $mask) => perft(Pos::<turns::Black, castling::$st, ep_squares::None>::new($cell), $token, $depth),
+                (Side::White, $mask) => perft(Pos::<turns::White, castling::$st, $ep>::new($cell), $token, $depth),
+                (Side::Black, $mask) => perft(Pos::<turns::Black, castling::$st, $ep>::new($cell), $token, $depth),
             )*
             _ => unreachable!("invalid castling mask"),
         }
@@ -951,9 +962,14 @@ macro_rules! perft_fen_dispatch {
 /// Run perft from an arbitrary FEN string.
 pub fn perft_fen(fen: &str, depth: u8) -> u64 {
     let (board, side, castling) = parse_fen(fen);
+    let has_ep = board.ep_square.is_some();
     GhostToken::new(|mut token| {
         let cell = GhostCell::new(board);
-        perft_fen_dispatch!(&cell, &mut token, depth, side, castling)
+        if has_ep {
+            perft_fen_dispatch!(&cell, &mut token, depth, side, castling, ep_squares::Some)
+        } else {
+            perft_fen_dispatch!(&cell, &mut token, depth, side, castling, ep_squares::None)
+        }
     })
 }
 
@@ -996,5 +1012,12 @@ mod tests {
     #[test]
     fn perft_position_6() {
         assert_perft("r4rk1/1pp1qppp/p1np1n2/2b1p1B1/2B1P1b1/P1NP1N2/1PP1QPPP/R4RK1 w - - 0 10", 5, 164_075_551);
+    }
+
+    // Position with an en-passant square in the FEN, so the `perft_fen` dispatch
+    // selects `ep_squares::Some` (rather than the default `None`).
+    #[test]
+    fn perft_ep_initial() {
+        assert_perft("4k3/8/8/3pP3/8/8/8/4K3 w - d6 0 1", 3, 276);
     }
 }
