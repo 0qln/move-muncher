@@ -1,5 +1,5 @@
 use clap::Parser;
-use muncher_core::{init, perft_fen};
+use muncher_core::perft_fen;
 
 #[derive(Parser, Debug)]
 #[command(version, about, long_about = None)]
@@ -13,8 +13,6 @@ struct Args {
 }
 
 fn main() {
-    init();
-
     let args = Args::parse();
 
     let fen = args.fen.as_deref().unwrap_or("rnbqkbnr/pppppppp/8/8/8/8/PPPPPPPP/RNBQKBNR w KQkq - 0 1");

@@ -1,5 +1,5 @@
 use criterion::{Criterion, criterion_group, criterion_main};
-use muncher_core::{init, perft_fen};
+use muncher_core::perft_fen;
 
 /// The six standard perft positions — the same set used by the unit tests (and
 /// nephrid's move-generation benchmarks).
@@ -13,8 +13,6 @@ const POSITIONS: &[(&str, &str, u8)] = &[
 ];
 
 fn perft(c: &mut Criterion) {
-    init();
-
     let mut group = c.benchmark_group("perft");
     group.sample_size(30);
     for (name, fen, depth) in POSITIONS {

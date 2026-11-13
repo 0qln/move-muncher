@@ -9,18 +9,13 @@ use engine::core::{
     coordinates::{Square, castling as castling_utils, files, pawn_utils},
     move_iter::{
         bishop, king, knight, pawn, rook,
-        sliding_piece::{SlidingAttacks, magics},
+        sliding_piece::SlidingAttacks,
     },
     piece::{Piece, piece_type},
     position::PieceInfo,
 };
 use ghost_cell::{GhostCell, GhostToken};
 use std::marker::PhantomData;
-
-pub fn init() {
-    // TODO: magics compile time initialization
-    magics::init();
-}
 
 pub trait Turn {
     type Next: Turn;
@@ -977,7 +972,6 @@ mod tests {
     use super::*;
 
     fn assert_perft(fen: &str, depth: u8, expected: u64) {
-        init();
         assert_eq!(perft_fen(fen, depth), expected, "perft({depth}) mismatch for {fen}");
     }
 
