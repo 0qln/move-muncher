@@ -18,6 +18,7 @@ use ghost_cell::{GhostCell, GhostToken};
 use std::marker::PhantomData;
 
 pub fn init() {
+    // TODO: magics compile time initialization
     magics::init();
 }
 
@@ -42,8 +43,8 @@ pub mod turns {
         type Prev = Black;
         const COLOR: Color = colors::WHITE;
 
-        type Castling_TakeK<C: Castling> = C::Take_1000;
-        type Castling_TakeQ<C: Castling> = C::Take_0100;
+        type Castling_TakeK<C: Castling> = C::Take_WK;
+        type Castling_TakeQ<C: Castling> = C::Take_WQ;
     }
 
     impl Turn for Black {
@@ -51,8 +52,8 @@ pub mod turns {
         type Prev = White;
         const COLOR: Color = colors::BLACK;
 
-        type Castling_TakeK<C: Castling> = C::Take_0010;
-        type Castling_TakeQ<C: Castling> = C::Take_0001;
+        type Castling_TakeK<C: Castling> = C::Take_BK;
+        type Castling_TakeQ<C: Castling> = C::Take_BQ;
     }
 }
 
@@ -60,10 +61,10 @@ pub mod turns {
 #[allow(non_camel_case_types)]
 #[rustfmt::skip]
 pub const trait Castling {
-    type Take_1000: Castling;
-    type Take_0100: Castling;
-    type Take_0010: Castling;
-    type Take_0001: Castling;
+    type Take_WK: Castling;
+    type Take_WQ: Castling;
+    type Take_BK: Castling;
+    type Take_BQ: Castling;
 
     const RIGHTS: u8;
     fn has_w_k() -> bool { Self::RIGHTS & 0b1000 != 0 }
@@ -92,10 +93,10 @@ pub mod castling {
             $(
                 pub struct $st;
                 impl Castling for $st {
-                    type Take_1000 = $t1000;
-                    type Take_0100 = $t0100;
-                    type Take_0010 = $t0010;
-                    type Take_0001 = $t0001;
+                    type Take_WK = $t1000;
+                    type Take_WQ = $t0100;
+                    type Take_BK = $t0010;
+                    type Take_BQ = $t0001;
                     const RIGHTS: u8 = $rights;
                     type Take_K<T: Turn> = <T as Turn>::Castling_TakeK<Self>;
                     type Take_Q<T: Turn> = <T as Turn>::Castling_TakeQ<Self>;
@@ -127,10 +128,6 @@ pub mod castling {
 
 pub trait EpSquare {
     type Next<M: Move>: EpSquare;
-
-    /// Whether an en-passant capture is available in this position. A
-    /// compile-time constant, so move generation branches on it without any
-    /// runtime check.
     const AVAILABLE: bool;
 }
 pub mod ep_squares {
@@ -185,6 +182,7 @@ pub struct Board {
     history: Vec<Undo>,
 }
 
+// TODO: move this into the stack of the perft function?
 struct Undo {
     captured: Option<(Square, Piece)>,
     prev_ep: Option<Square>,
@@ -241,6 +239,7 @@ impl Board {
         undo.captured
     }
 
+    // TODO: make the nephrid package take an interface for a board and then reuse that logic?
     /// Build a board from the piece-placement field of a FEN (turn, castling and
     /// en-passant are supplied as type parameters on `Pos`, not stored here).
     pub fn from_fen(piece_placement: &str) -> Self {
