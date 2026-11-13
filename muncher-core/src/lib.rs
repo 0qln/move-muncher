@@ -167,18 +167,20 @@ impl<F: MoveFlag> Move for MoveValue<F> {
     }
 }
 
-/// The board: piece placement (`PieceInfo`) plus the runtime en-passant square
-/// and an undo stack for captures. Turn, castling and en-passant availability
-/// live in the type parameters of `Pos`; only the *square* is runtime.
+/// The board: piece placement (`PieceInfo`) plus the runtime en-passant square.
+/// Turn, castling and en-passant availability live in the type parameters of
+/// `Pos`; only the *square* is runtime. Undo state is threaded through
+/// `make`/`unmake` and lives on the perft call stack, not here.
 pub struct Board {
     pieces: PieceInfo,
     ep_square: Option<Square>,
     castling: u8,
-    history: Vec<Undo>,
 }
 
-// TODO: move this into the stack of the perft function?
-struct Undo {
+/// Undo info for one move, threaded through `MoveFlag::make`/`unmake` so it can
+/// live on the perft recursion's stack instead of a heap-allocated `Vec`.
+#[derive(Clone, Copy)]
+pub struct Undo {
     captured: Option<(Square, Piece)>,
     prev_ep: Option<Square>,
     prev_castling: u8,
@@ -195,7 +197,7 @@ impl Board {
         self.pieces.put_piece(sq, piece, &mut ());
     }
 
-    fn begin_move(&mut self, captured: Option<(Square, Piece)>, from: Square, us: Color) {
+    fn begin_move(&mut self, captured: Option<(Square, Piece)>, from: Square, us: Color) -> Undo {
         let prev_ep = self.ep_square;
         let prev_castling = self.castling;
         self.ep_square = None;
@@ -220,18 +222,16 @@ impl Board {
             }
         }
 
-        self.history.push(Undo {
+        Undo {
             captured,
             prev_ep,
             prev_castling,
-        });
+        }
     }
 
-    fn end_move(&mut self) -> Option<(Square, Piece)> {
-        let undo = self.history.pop().unwrap();
+    fn end_move(&mut self, undo: Undo) {
         self.ep_square = undo.prev_ep;
         self.castling = undo.prev_castling;
-        undo.captured
     }
 
     // TODO: make the nephrid package take an interface for a board and then reuse that logic?
@@ -314,7 +314,6 @@ impl Default for Board {
             pieces: PieceInfo::default(),
             ep_square: None,
             castling: 0,
-            history: Vec::new(),
         }
     }
 }
@@ -326,8 +325,8 @@ pub trait MoveFlag {
     /// The en-passant state after this move.
     type ApplyEp: EpSquare;
 
-    fn make(board: &mut Board, from: Square, to: Square, us: Color);
-    fn unmake(board: &mut Board, from: Square, to: Square, us: Color);
+    fn make(board: &mut Board, from: Square, to: Square, us: Color) -> Undo;
+    fn unmake(board: &mut Board, from: Square, to: Square, us: Color, undo: Undo);
 }
 
 mod move_flags {
@@ -352,59 +351,65 @@ mod move_flags {
     impl MoveFlag for Quiet {
         type ApplyCastling<C: Castling, T: Turn> = C;
         type ApplyEp = ep_squares::None;
-        fn make(board: &mut Board, from: Square, to: Square, us: Color) {
-            board.begin_move(None, from, us);
+        fn make(board: &mut Board, from: Square, to: Square, us: Color) -> Undo {
+            let undo = board.begin_move(None, from, us);
             board.move_piece(from, to);
+            undo
         }
-        fn unmake(board: &mut Board, from: Square, to: Square, _us: Color) {
+        fn unmake(board: &mut Board, from: Square, to: Square, _us: Color, undo: Undo) {
             board.move_piece(to, from);
-            board.end_move();
+            board.end_move(undo);
         }
     }
 
     impl MoveFlag for DoublePawnPush {
         type ApplyCastling<C: Castling, T: Turn> = C;
         type ApplyEp = ep_squares::Some;
-        fn make(board: &mut Board, from: Square, to: Square, us: Color) {
-            board.begin_move(None, from, us);
+        fn make(board: &mut Board, from: Square, to: Square, us: Color) -> Undo {
+            let undo = board.begin_move(None, from, us);
             board.move_piece(from, to);
             // The capture square is the doubled pawn's destination square.
             board.ep_square = Some(to);
+            undo
         }
-        fn unmake(board: &mut Board, from: Square, to: Square, _us: Color) {
+        fn unmake(board: &mut Board, from: Square, to: Square, _us: Color, undo: Undo) {
             board.move_piece(to, from);
-            board.end_move();
+            board.end_move(undo);
         }
     }
 
     impl MoveFlag for Capture {
         type ApplyCastling<C: Castling, T: Turn> = C;
         type ApplyEp = ep_squares::None;
-        fn make(board: &mut Board, from: Square, to: Square, us: Color) {
+        fn make(board: &mut Board, from: Square, to: Square, us: Color) -> Undo {
             let captured = board.remove_piece(to);
-            board.begin_move(Some((to, captured)), from, us);
+            let undo = board.begin_move(Some((to, captured)), from, us);
             board.move_piece(from, to);
+            undo
         }
-        fn unmake(board: &mut Board, from: Square, to: Square, _us: Color) {
+        fn unmake(board: &mut Board, from: Square, to: Square, _us: Color, undo: Undo) {
             board.move_piece(to, from);
-            let (sq, cap) = board.end_move().unwrap();
+            let (sq, cap) = undo.captured.unwrap();
             board.put_piece(sq, cap);
+            board.end_move(undo);
         }
     }
 
     impl MoveFlag for EnPassant {
         type ApplyCastling<C: Castling, T: Turn> = C;
         type ApplyEp = ep_squares::None;
-        fn make(board: &mut Board, from: Square, to: Square, us: Color) {
+        fn make(board: &mut Board, from: Square, to: Square, us: Color) -> Undo {
             let cap_sq = pawn_utils::backward(Bitboard::from(to), pawn_utils::single_step(us)).lsb().unwrap();
             let captured = board.remove_piece(cap_sq);
-            board.begin_move(Some((cap_sq, captured)), from, us);
+            let undo = board.begin_move(Some((cap_sq, captured)), from, us);
             board.move_piece(from, to);
+            undo
         }
-        fn unmake(board: &mut Board, from: Square, to: Square, _us: Color) {
+        fn unmake(board: &mut Board, from: Square, to: Square, _us: Color, undo: Undo) {
             board.move_piece(to, from);
-            let (sq, cap) = board.end_move().unwrap();
+            let (sq, cap) = undo.captured.unwrap();
             board.put_piece(sq, cap);
+            board.end_move(undo);
         }
     }
 
@@ -413,15 +418,16 @@ mod move_flags {
             impl MoveFlag for $flag {
                 type ApplyCastling<C: Castling, T: Turn> = C;
                 type ApplyEp = ep_squares::None;
-                fn make(board: &mut Board, from: Square, to: Square, us: Color) {
-                    board.begin_move(None, from, us);
+                fn make(board: &mut Board, from: Square, to: Square, us: Color) -> Undo {
+                    let undo = board.begin_move(None, from, us);
                     board.remove_piece(from);
                     board.put_piece(to, Piece::from((us, $pt)));
+                    undo
                 }
-                fn unmake(board: &mut Board, from: Square, to: Square, us: Color) {
+                fn unmake(board: &mut Board, from: Square, to: Square, us: Color, undo: Undo) {
                     board.remove_piece(to);
                     board.put_piece(from, Piece::from((us, piece_type::PAWN)));
-                    board.end_move();
+                    board.end_move(undo);
                 }
             }
         };
@@ -436,17 +442,19 @@ mod move_flags {
             impl MoveFlag for $flag {
                 type ApplyCastling<C: Castling, T: Turn> = C;
                 type ApplyEp = ep_squares::None;
-                fn make(board: &mut Board, from: Square, to: Square, us: Color) {
+                fn make(board: &mut Board, from: Square, to: Square, us: Color) -> Undo {
                     let captured = board.remove_piece(to);
-                    board.begin_move(Some((to, captured)), from, us);
+                    let undo = board.begin_move(Some((to, captured)), from, us);
                     board.remove_piece(from);
                     board.put_piece(to, Piece::from((us, $pt)));
+                    undo
                 }
-                fn unmake(board: &mut Board, from: Square, to: Square, us: Color) {
+                fn unmake(board: &mut Board, from: Square, to: Square, us: Color, undo: Undo) {
                     board.remove_piece(to);
                     board.put_piece(from, Piece::from((us, piece_type::PAWN)));
-                    let (sq, cap) = board.end_move().unwrap();
+                    let (sq, cap) = undo.captured.unwrap();
                     board.put_piece(sq, cap);
+                    board.end_move(undo);
                 }
             }
         };
@@ -459,34 +467,36 @@ mod move_flags {
     impl MoveFlag for KingCastle {
         type ApplyCastling<C: Castling, T: Turn> = <<C as Castling>::Take_K<T> as Castling>::Take_Q<T>;
         type ApplyEp = ep_squares::None;
-        fn make(board: &mut Board, from: Square, to: Square, us: Color) {
+        fn make(board: &mut Board, from: Square, to: Square, us: Color) -> Undo {
             let rank = castling_utils::castling_rank(us);
-            board.begin_move(None, from, us);
+            let undo = board.begin_move(None, from, us);
             board.move_piece(from, to);
             board.move_piece(Square::from((files::H, rank)), Square::from((files::F, rank)));
+            undo
         }
-        fn unmake(board: &mut Board, from: Square, to: Square, us: Color) {
+        fn unmake(board: &mut Board, from: Square, to: Square, us: Color, undo: Undo) {
             let rank = castling_utils::castling_rank(us);
             board.move_piece(to, from);
             board.move_piece(Square::from((files::F, rank)), Square::from((files::H, rank)));
-            board.end_move();
+            board.end_move(undo);
         }
     }
 
     impl MoveFlag for QueenCastle {
         type ApplyCastling<C: Castling, T: Turn> = <<C as Castling>::Take_K<T> as Castling>::Take_Q<T>;
         type ApplyEp = ep_squares::None;
-        fn make(board: &mut Board, from: Square, to: Square, us: Color) {
+        fn make(board: &mut Board, from: Square, to: Square, us: Color) -> Undo {
             let rank = castling_utils::castling_rank(us);
-            board.begin_move(None, from, us);
+            let undo = board.begin_move(None, from, us);
             board.move_piece(from, to);
             board.move_piece(Square::from((files::A, rank)), Square::from((files::D, rank)));
+            undo
         }
-        fn unmake(board: &mut Board, from: Square, to: Square, us: Color) {
+        fn unmake(board: &mut Board, from: Square, to: Square, us: Color, undo: Undo) {
             let rank = castling_utils::castling_rank(us);
             board.move_piece(to, from);
             board.move_piece(Square::from((files::D, rank)), Square::from((files::A, rank)));
-            board.end_move();
+            board.end_move(undo);
         }
     }
 }
@@ -518,21 +528,21 @@ impl<'a, 'id, T, C, Ep> Pos<'a, 'id, T, C, Ep> {
 }
 
 impl<'a, 'id, T: Turn, C: Castling, Ep: EpSquare> Pos<'a, 'id, T, C, Ep> {
-    fn make_move<M: Move>(&self, m: M, token: &mut GhostToken<'id>) -> Pos<'a, 'id, T::Next, C::Next<M, T>, Ep::Next<M>> {
+    fn make_move<M: Move>(&self, m: M, token: &mut GhostToken<'id>) -> (Pos<'a, 'id, T::Next, C::Next<M, T>, Ep::Next<M>>, Undo) {
         let board = self.board.borrow_mut(token);
-        <M::Flag as MoveFlag>::make(board, m.from(), m.to(), T::COLOR);
-        Pos {
+        let undo = <M::Flag as MoveFlag>::make(board, m.from(), m.to(), T::COLOR);
+        (Pos {
             _turn: PhantomData,
             _castling: PhantomData,
             _ep_square: PhantomData,
             board: self.board,
-        }
+        }, undo)
     }
 
-    fn unmake_move<M: Move>(&self, m: M, token: &mut GhostToken<'id>) {
+    fn unmake_move<M: Move>(&self, m: M, undo: Undo, token: &mut GhostToken<'id>) {
         let board = self.board.borrow_mut(token);
         // `T` is the side to move after the move was made, so the mover is the previous side.
-        <M::Flag as MoveFlag>::unmake(board, m.from(), m.to(), T::Prev::COLOR);
+        <M::Flag as MoveFlag>::unmake(board, m.from(), m.to(), T::Prev::COLOR, undo);
     }
 }
 
@@ -552,9 +562,9 @@ pub fn perft<'a, 'id, T: Turn, C: Castling, Ep: EpSquare>(pos: Pos<'a, 'id, T, C
 
     impl<'a, 'id, T: Turn, C: Castling, Ep: EpSquare> MoveVisitor<'id, u64> for Counter<'a, 'id, T, C, Ep> {
         fn invoke<M: Move>(&mut self, count: u64, m: M, token: &mut GhostToken<'id>) -> u64 {
-            let next = self.pos.make_move(m, token);
+            let (next, undo) = self.pos.make_move(m, token);
             let count = count + perft(next, token, self.depth - 1);
-            next.unmake_move(m, token);
+            next.unmake_move(m, undo, token);
             count
         }
     }
