@@ -3,6 +3,11 @@ name = "muncher"
 version = "0.1.0"
 edition = "2024"
 
+[[bin]]
+name = "muncher"
+path = "src/main.rs"
+bench = false
+
 [dependencies]
 clap = { version = "4.6.7", features = ["derive"] }
 muncher_core = { path = "../muncher-core" }

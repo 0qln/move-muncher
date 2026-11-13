@@ -3,6 +3,12 @@ name = "muncher_core"
 version = "0.1.0"
 edition = "2024"
 
+[lib]
+# `cargo bench` would otherwise run the lib target in bench mode with the
+# standard test harness, which rejects criterion flags; disable it so only the
+# explicit `[[bench]]` criterion target runs.
+bench = false
+
 [dependencies]
 engine = { path = "../../nephrid/engine" }
 ghost-cell = "0.2"
