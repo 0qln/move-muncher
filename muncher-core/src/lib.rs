@@ -203,7 +203,8 @@ impl Board {
         self.ep_square = None;
 
         // A king or rook moving off its home square forfeits that side's
-        // castling right, as does capturing an enemy rook on its home square.
+        // castling right. (Capturing an enemy rook on its home square is the
+        // dedicated capture flags' job, not this generic path's.)
         let rank = castling_utils::castling_rank(us);
         if from == Square::from((files::E, rank)) {
             self.castling &= !(0b1100u8 >> (us.v() * 2));
@@ -211,15 +212,6 @@ impl Board {
             self.castling &= !(0b0100u8 >> (us.v() * 2));
         } else if from == Square::from((files::H, rank)) {
             self.castling &= !(0b1000u8 >> (us.v() * 2));
-        }
-        if let Some((cap_sq, _)) = captured {
-            let them = !us;
-            let their_rank = castling_utils::castling_rank(them);
-            if cap_sq == Square::from((files::A, their_rank)) {
-                self.castling &= !(0b0100u8 >> (them.v() * 2));
-            } else if cap_sq == Square::from((files::H, their_rank)) {
-                self.castling &= !(0b1000u8 >> (them.v() * 2));
-            }
         }
 
         Undo {
@@ -232,6 +224,24 @@ impl Board {
     fn end_move(&mut self, undo: Undo) {
         self.ep_square = undo.prev_ep;
         self.castling = undo.prev_castling;
+    }
+
+    /// Forfeit a castling right by clearing the given bit(s).
+    fn forfeit_castling(&mut self, mask: u8) {
+        self.castling &= !mask;
+    }
+
+    /// Capturing an enemy rook on its home square forfeits that side's castling
+    /// right. Promotion captures are the only captures that still need this
+    /// runtime check: a pawn landing on the back rank may take a home rook.
+    fn forfeit_captured_rook(&mut self, to: Square, us: Color) {
+        let them = !us;
+        let their_rank = castling_utils::castling_rank(them);
+        if to == Square::from((files::A, their_rank)) {
+            self.castling &= !(0b0100u8 >> (them.v() * 2));
+        } else if to == Square::from((files::H, their_rank)) {
+            self.castling &= !(0b1000u8 >> (them.v() * 2));
+        }
     }
 
     // TODO: make the nephrid package take an interface for a board and then reuse that logic?
@@ -344,8 +354,9 @@ mod move_flags {
     pub struct CapturePromotionQueen;
     pub struct KingCastle;
     pub struct QueenCastle;
-    pub struct Capture; // TODO: move flag for rook capture such that we can skip the validation in
-    // the move gen and do castling rights completely at compiletime
+    pub struct Capture;
+    pub struct CaptureRookQueenside;
+    pub struct CaptureRookKingside;
     pub struct EnPassant;
 
     impl MoveFlag for Quiet {
@@ -384,6 +395,44 @@ mod move_flags {
         fn make(board: &mut Board, from: Square, to: Square, us: Color) -> Undo {
             let captured = board.remove_piece(to);
             let undo = board.begin_move(Some((to, captured)), from, us);
+            board.move_piece(from, to);
+            undo
+        }
+        fn unmake(board: &mut Board, from: Square, to: Square, _us: Color, undo: Undo) {
+            board.move_piece(to, from);
+            let (sq, cap) = undo.captured.unwrap();
+            board.put_piece(sq, cap);
+            board.end_move(undo);
+        }
+    }
+
+    impl MoveFlag for CaptureRookQueenside {
+        type ApplyCastling<C: Castling, T: Turn> = C::Take_Q<T::Next>;
+        type ApplyEp = ep_squares::None;
+        fn make(board: &mut Board, from: Square, to: Square, us: Color) -> Undo {
+            let captured = board.remove_piece(to);
+            let undo = board.begin_move(Some((to, captured)), from, us);
+            let them = !us;
+            board.forfeit_castling(0b0100u8 >> (them.v() * 2));
+            board.move_piece(from, to);
+            undo
+        }
+        fn unmake(board: &mut Board, from: Square, to: Square, _us: Color, undo: Undo) {
+            board.move_piece(to, from);
+            let (sq, cap) = undo.captured.unwrap();
+            board.put_piece(sq, cap);
+            board.end_move(undo);
+        }
+    }
+
+    impl MoveFlag for CaptureRookKingside {
+        type ApplyCastling<C: Castling, T: Turn> = C::Take_K<T::Next>;
+        type ApplyEp = ep_squares::None;
+        fn make(board: &mut Board, from: Square, to: Square, us: Color) -> Undo {
+            let captured = board.remove_piece(to);
+            let undo = board.begin_move(Some((to, captured)), from, us);
+            let them = !us;
+            board.forfeit_castling(0b1000u8 >> (them.v() * 2));
             board.move_piece(from, to);
             undo
         }
@@ -445,6 +494,8 @@ mod move_flags {
                 fn make(board: &mut Board, from: Square, to: Square, us: Color) -> Undo {
                     let captured = board.remove_piece(to);
                     let undo = board.begin_move(Some((to, captured)), from, us);
+                    // A promoting pawn may capture a rook still on its home square.
+                    board.forfeit_captured_rook(to, us);
                     board.remove_piece(from);
                     board.put_piece(to, Piece::from((us, $pt)));
                     undo
@@ -685,6 +736,12 @@ where
     let promo_bb = Bitboard::from(pawn_utils::promo_rank(us));
     let start_bb = Bitboard::from(pawn_utils::start_rank(us));
 
+    // Enemy home rook squares: capturing a rook here forfeits that side's
+    // castling right, which the dedicated capture flags encode at compile time.
+    let them_rank = castling_utils::castling_rank(!us);
+    let rook_q_bb = Bitboard::from(Square::from((files::A, them_rank)));
+    let rook_k_bb = Bitboard::from(Square::from((files::H, them_rank)));
+
     macro_rules! emit {
         ($flag:ty, $from:expr, $to:expr) => {
             acc = visitor.invoke(
@@ -697,6 +754,25 @@ where
                 token,
             );
         };
+    }
+
+    // Emit captures, routing home-rook captures to their dedicated flags.
+    macro_rules! emit_captures {
+        ($from:expr, $captures:expr) => {{
+            let caps = $captures;
+            let q = caps & rook_q_bb;
+            let k = caps & rook_k_bb;
+            let plain = caps & !(rook_q_bb | rook_k_bb);
+            for t in plain {
+                emit!(move_flags::Capture, $from, t);
+            }
+            for t in q {
+                emit!(move_flags::CaptureRookQueenside, $from, t);
+            }
+            for t in k {
+                emit!(move_flags::CaptureRookKingside, $from, t);
+            }
+        }};
     }
 
     // Non-king pieces (no moves resolve a double check).
@@ -712,10 +788,7 @@ where
                 emit!(move_flags::Quiet, from, to);
             }
 
-            let captures = targets & capture_mask;
-            for to in captures {
-                emit!(move_flags::Capture, from, to);
-            }
+            emit_captures!(from, targets & capture_mask);
         }
 
         // Rook-like sliders (rooks + queens).
@@ -730,10 +803,7 @@ where
                 emit!(move_flags::Quiet, from, to);
             }
 
-            let captures = targets & capture_mask;
-            for to in captures {
-                emit!(move_flags::Capture, from, to);
-            }
+            emit_captures!(from, targets & capture_mask);
         }
 
         // Bishop-like sliders (bishops + queens).
@@ -747,10 +817,7 @@ where
                 emit!(move_flags::Quiet, from, to);
             }
 
-            let captures = targets & capture_mask;
-            for to in captures {
-                emit!(move_flags::Capture, from, to);
-            }
+            emit_captures!(from, targets & capture_mask);
         }
 
         // Pawns.
@@ -840,7 +907,13 @@ where
         let captures = targets & s.them_bb;
         for to in captures {
             if attackers_to(to, occ_no_king, !us, &s.enemy).is_empty() {
-                emit!(move_flags::Capture, s.king_sq, to);
+                if !(Bitboard::from(to) & rook_q_bb).is_empty() {
+                    emit!(move_flags::CaptureRookQueenside, s.king_sq, to);
+                } else if !(Bitboard::from(to) & rook_k_bb).is_empty() {
+                    emit!(move_flags::CaptureRookKingside, s.king_sq, to);
+                } else {
+                    emit!(move_flags::Capture, s.king_sq, to);
+                }
             }
         }
     }
