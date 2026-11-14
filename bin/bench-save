@@ -1,0 +1,11 @@
+#!/usr/bin/env bash
+# Save the current perft benchmark run as a criterion baseline.
+#
+# Usage: bench-save [<name>]
+#   <name> defaults to the current git commit short hash.
+set -euo pipefail
+
+cd "$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
+
+name="${1:-$(git rev-parse --short HEAD)}"
+cargo bench -- --save-baseline "$name"
