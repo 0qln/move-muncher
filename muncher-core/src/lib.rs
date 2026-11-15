@@ -2,15 +2,14 @@
 #![allow(non_camel_case_types)]
 #![feature(const_trait_impl)]
 #![feature(const_cmp)]
+#![feature(const_ops)]
+#![feature(const_convert)]
 
 use engine::core::{
     bitboard::Bitboard,
     color::{Color, colors},
     coordinates::{Square, castling as castling_utils, files, pawn_utils},
-    move_iter::{
-        bishop, king, knight, pawn, rook,
-        sliding_piece::SlidingAttacks,
-    },
+    move_iter::{bishop, king, knight, pawn, rook, sliding_piece::SlidingAttacks},
     piece::{Piece, piece_type},
     position::PieceInfo,
 };
@@ -169,16 +168,13 @@ impl<F: MoveFlag> Move for MoveValue<F> {
 
 /// The board: piece placement (`PieceInfo`) plus the runtime en-passant square.
 /// Turn, castling and en-passant availability live in the type parameters of
-/// `Pos`; only the *square* is runtime. Undo state is threaded through
-/// `make`/`unmake` and lives on the perft call stack, not here.
+/// `Pos`; only the *square* is runtime.
 pub struct Board {
     pieces: PieceInfo,
     ep_square: Option<Square>,
     castling: u8,
 }
 
-/// Undo info for one move, threaded through `MoveFlag::make`/`unmake` so it can
-/// live on the perft recursion's stack instead of a heap-allocated `Vec`.
 #[derive(Clone, Copy)]
 pub struct Undo {
     captured: Option<(Square, Piece)>,
@@ -582,12 +578,15 @@ impl<'a, 'id, T: Turn, C: Castling, Ep: EpSquare> Pos<'a, 'id, T, C, Ep> {
     fn make_move<M: Move>(&self, m: M, token: &mut GhostToken<'id>) -> (Pos<'a, 'id, T::Next, C::Next<M, T>, Ep::Next<M>>, Undo) {
         let board = self.board.borrow_mut(token);
         let undo = <M::Flag as MoveFlag>::make(board, m.from(), m.to(), T::COLOR);
-        (Pos {
-            _turn: PhantomData,
-            _castling: PhantomData,
-            _ep_square: PhantomData,
-            board: self.board,
-        }, undo)
+        (
+            Pos {
+                _turn: PhantomData,
+                _castling: PhantomData,
+                _ep_square: PhantomData,
+                board: self.board,
+            },
+            undo,
+        )
     }
 
     fn unmake_move<M: Move>(&self, m: M, undo: Undo, token: &mut GhostToken<'id>) {
@@ -646,7 +645,9 @@ fn attackers_to(to: Square, occ: Bitboard, by: Color, p: &[Bitboard; 6]) -> Bitb
 
 /// If `sq` is pinned against our king, restrict it to the pin ray; otherwise allow
 /// everything.
-fn pin_mask(sq: Square, blockers: Bitboard, king_sq: Square) -> Bitboard {
+const fn pin_mask(sq: Square, sq_bb: Bitboard, blockers: Bitboard, king_sq: Square) -> Bitboard {
+    assert!(sq_bb == Bitboard::from(sq));
+
     if (Bitboard::from(sq) & blockers).is_empty() {
         Bitboard::full()
     } else {
@@ -780,7 +781,8 @@ where
         // Knights.
         let knights = s.us[1];
         for from in knights {
-            let mask = pin_mask(from, s.blockers, s.king_sq);
+            let from_bb = Bitboard::from(from);
+            let mask = pin_mask(from, from_bb, s.blockers, s.king_sq);
             let targets = knight::lookup_attacks(from) & mask;
 
             let quiets = targets & quiet_mask;
@@ -795,7 +797,8 @@ where
         // TODO: deduplicate the pin_mask computation for the queens
         let r_n_q = s.us[3] | s.us[4];
         for from in r_n_q {
-            let mask = pin_mask(from, s.blockers, s.king_sq);
+            let from_bb = Bitboard::from(from);
+            let mask = pin_mask(from, from_bb, s.blockers, s.king_sq);
             let targets = rook::Rook::lookup_attacks(from, s.occ) & mask;
 
             let quiets = targets & quiet_mask;
@@ -809,7 +812,8 @@ where
         // Bishop-like sliders (bishops + queens).
         let b_n_q = s.us[2] | s.us[4];
         for from in b_n_q {
-            let mask = pin_mask(from, s.blockers, s.king_sq);
+            let from_bb = Bitboard::from(from);
+            let mask = pin_mask(from, from_bb, s.blockers, s.king_sq);
             let targets = bishop::Bishop::lookup_attacks(from, s.occ) & mask;
 
             let quiets = targets & quiet_mask;
@@ -825,7 +829,7 @@ where
         let pawns = s.us[0];
         for from in pawns {
             let from_bb = Bitboard::from(from);
-            let mask = pin_mask(from, s.blockers, s.king_sq);
+            let mask = pin_mask(from, from_bb, s.blockers, s.king_sq);
             let promo = !(from_bb & promo_bb).is_empty();
 
             // Single push.
@@ -918,7 +922,7 @@ where
         }
     }
 
-    // Castling (only out of check, through unattacked, empty squares). Rights
+    // Castling. Rights
     // are tracked at runtime in `Board::castling` and cleared when a king or
     // rook moves (or an enemy rook is captured on its home square); the home-
     // square checks below are a defensive extra.
