@@ -8,7 +8,7 @@
 use engine::core::{
     bitboard::Bitboard,
     color::{Color, colors},
-    coordinates::{Square, castling as castling_utils, files, pawn_utils},
+    coordinates::{Square, castling as castling_utils, compass_rose, files, pawn_utils},
     move_iter::{bishop, king, knight, pawn, rook, sliding_piece::SlidingAttacks},
     piece::{Piece, piece_type},
     position::PieceInfo,
@@ -824,15 +824,74 @@ where
             emit_captures!(from, targets & capture_mask);
         }
 
-        // Pawns.
-        // TODO: move all pawns at once
+        // Pawns. Unpinned pawns (the common case) are generated in bulk with
+        // bitboard shifts; pinned pawns are rare and still need a per-pawn
+        // pin-ray check.
         let pawns = s.us[0];
-        for from in pawns {
+        let pinned = pawns & s.blockers;
+        let unpinned = pawns & !s.blockers;
+        let promo_pawns = pawns & promo_bb;
+        let non_promo = pawns & !promo_bb;
+        let a_file = Bitboard::from(files::A);
+        let h_file = Bitboard::from(files::H);
+        let west = pawn_utils::capture(us, compass_rose::WEST);
+        let east = pawn_utils::capture(us, compass_rose::EAST);
+        let dstep = pawn_utils::double_step(us);
+
+        // Emit one move per destination square, deriving `from` by shifting `to`
+        // back along `dir`.
+        macro_rules! emit_shift {
+            ($flag:ty, $to_bb:expr, $dir:expr) => {
+                for to in $to_bb {
+                    let from = pawn_utils::backward(Bitboard::from(to), $dir).lsb().unwrap();
+                    emit!($flag, from, to);
+                }
+            };
+        }
+
+        // Single pushes (non-promoting).
+        emit_shift!(move_flags::Quiet, pawn_utils::forward(unpinned & non_promo, step) & quiet_mask, step);
+
+        // Single pushes (promoting).
+        for to in pawn_utils::forward(unpinned & promo_pawns, step) & quiet_mask {
+            let from = pawn_utils::backward(Bitboard::from(to), step).lsb().unwrap();
+            emit!(move_flags::PromotionKnight, from, to);
+            emit!(move_flags::PromotionBishop, from, to);
+            emit!(move_flags::PromotionRook, from, to);
+            emit!(move_flags::PromotionQueen, from, to);
+        }
+
+        // Double pushes: the middle square just needs to be empty; the
+        // destination must satisfy the quiet/block mask.
+        let dbl_from = (unpinned & start_bb) & !pawn_utils::backward(s.occ, step);
+        emit_shift!(move_flags::DoublePawnPush, pawn_utils::forward(dbl_from, dstep) & quiet_mask, dstep);
+
+        // Captures (non-promoting): west and east, guarding against file wrap.
+        emit_shift!(move_flags::Capture, pawn_utils::forward((unpinned & non_promo) & !a_file, west) & capture_mask, west);
+        emit_shift!(move_flags::Capture, pawn_utils::forward((unpinned & non_promo) & !h_file, east) & capture_mask, east);
+
+        // Captures (promoting).
+        for to in pawn_utils::forward((unpinned & promo_pawns) & !a_file, west) & capture_mask {
+            let from = pawn_utils::backward(Bitboard::from(to), west).lsb().unwrap();
+            emit!(move_flags::CapturePromotionKnight, from, to);
+            emit!(move_flags::CapturePromotionBishop, from, to);
+            emit!(move_flags::CapturePromotionRook, from, to);
+            emit!(move_flags::CapturePromotionQueen, from, to);
+        }
+        for to in pawn_utils::forward((unpinned & promo_pawns) & !h_file, east) & capture_mask {
+            let from = pawn_utils::backward(Bitboard::from(to), east).lsb().unwrap();
+            emit!(move_flags::CapturePromotionKnight, from, to);
+            emit!(move_flags::CapturePromotionBishop, from, to);
+            emit!(move_flags::CapturePromotionRook, from, to);
+            emit!(move_flags::CapturePromotionQueen, from, to);
+        }
+
+        // Pinned pawns: restrict every move to the pin ray.
+        for from in pinned {
             let from_bb = Bitboard::from(from);
             let mask = pin_mask(from, from_bb, s.blockers, s.king_sq);
             let promo = !(from_bb & promo_bb).is_empty();
 
-            // Single push.
             let push = pawn_utils::forward(from_bb, step) & quiet_mask & mask;
             if let Some(to) = push.lsb() {
                 if promo {
@@ -845,8 +904,6 @@ where
                 }
             }
 
-            // Double push: the middle square just needs to be empty; the
-            // destination must satisfy the quiet/block mask (and not be pinned).
             if !(from_bb & start_bb).is_empty() {
                 let middle = pawn_utils::forward(from_bb, step);
                 if (middle & s.occ).is_empty() {
@@ -857,7 +914,6 @@ where
                 }
             }
 
-            // Captures.
             let mut caps = pawn::lookup_attacks(from, us) & capture_mask & mask;
             while let Some(to) = caps.pop_lsb() {
                 if promo {
@@ -869,29 +925,33 @@ where
                     emit!(move_flags::Capture, from, to);
                 }
             }
+        }
 
-            // En passant (with the ep-pin legality check). `cap` is the capture
-            // square (the enemy pawn); `tgt` is where our pawn lands.
-            // `Ep::AVAILABLE` is a compile-time constant, so this whole block is
-            // eliminated when the position has no en-passant square.
-            if Ep::AVAILABLE {
-                if let Some(cap) = s.ep_capture {
-                    let tgt = pawn_utils::forward(Bitboard::from(cap), step).lsb().unwrap();
-                    if !(pawn::lookup_attacks(from, us) & Bitboard::from(tgt)).is_empty() {
-                        let legal = {
-                            let board = pos.board.borrow_mut(token);
-                            let captured = board.remove_piece(cap);
-                            board.move_piece(from, tgt);
-                            let occ_after = board.pieces.get_occupancy();
-                            let enemy_after = piece_array(&board.pieces, !us);
-                            let legal = attackers_to(s.king_sq, occ_after, !us, &enemy_after).is_empty();
-                            board.move_piece(tgt, from);
-                            board.put_piece(cap, captured);
-                            legal
-                        };
-                        if legal {
-                            emit!(move_flags::EnPassant, from, tgt);
-                        }
+        // En passant (pinned or not: the legality simulation below also covers
+        // the pin case by exposing the king). `cap` is the captured pawn's
+        // square; `tgt` is where our pawn lands.
+        // `Ep::AVAILABLE` is a compile-time constant, so this whole block is
+        // eliminated when the position has no en-passant square.
+        if Ep::AVAILABLE {
+            if let Some(cap) = s.ep_capture {
+                let tgt_bb = pawn_utils::forward(Bitboard::from(cap), step);
+                let tgt = tgt_bb.lsb().unwrap();
+                let ep_from = pawn_utils::backward(pawn_utils::forward(pawns & !a_file, west) & tgt_bb, west)
+                    | pawn_utils::backward(pawn_utils::forward(pawns & !h_file, east) & tgt_bb, east);
+                for from in ep_from {
+                    let legal = {
+                        let board = pos.board.borrow_mut(token);
+                        let captured = board.remove_piece(cap);
+                        board.move_piece(from, tgt);
+                        let occ_after = board.pieces.get_occupancy();
+                        let enemy_after = piece_array(&board.pieces, !us);
+                        let legal = attackers_to(s.king_sq, occ_after, !us, &enemy_after).is_empty();
+                        board.move_piece(tgt, from);
+                        board.put_piece(cap, captured);
+                        legal
+                    };
+                    if legal {
+                        emit!(move_flags::EnPassant, from, tgt);
                     }
                 }
             }
